@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relcoord"
-dynamic = ["version"]
+version = "0.1.1"
 description = "Image version service for relcoord."
 readme = "README.md"
 license = "MIT"
@@ -26,15 +26,6 @@ dev = [
   "bktools",
 ]
 
-[tool.hatch.build.hooks.vcs]
-version-file = "src/relcoord/_version.py"
-
-[tool.setuptools_scm]
-version_scheme = "guess-next-semver"
-local_scheme = "node-and-date"
-
-[tool.hatch.version]
-source = "vcs"
 
 [[tool.uv.index]]
 url = "https://repo.noa.re/"
