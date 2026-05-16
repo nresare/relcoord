@@ -10,14 +10,12 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from relcoord.errors import EquivalentVersionExistsError, ValidationError
-from relcoord.in_memory_repository import InMemoryImageVersionRepository
 from relcoord.repository import ImageVersionRepository
 from relcoord.service import ImageVersionService
 
 
-def create_app(repository: ImageVersionRepository | None = None) -> Starlette:
-    repo = repository or InMemoryImageVersionRepository()
-    service = ImageVersionService(repository=repo)
+def create_app(repository: ImageVersionRepository) -> Starlette:
+    service = ImageVersionService(repository=repository)
 
     async def health(_: Request) -> Response:
         return JSONResponse({"status": "ok"})
@@ -25,8 +23,18 @@ def create_app(repository: ImageVersionRepository | None = None) -> Starlette:
     async def register_image_version(request: Request) -> Response:
         try:
             payload = await _read_json(request)
-            image = payload.get("image")
-            version = payload.get("version")
+            image = _required_non_empty_string(
+                payload,
+                "image",
+                error="invalid_image",
+                message="image must be a non-empty string",
+            )
+            version = _required_non_empty_string(
+                payload,
+                "version",
+                error="invalid_version",
+                message="version must be a non-empty string",
+            )
             result = await service.register_version(image=image, version=version)
         except ValidationError as exc:
             return _json_error(status_code=400, error=exc.error, message=exc.message)
@@ -50,7 +58,12 @@ def create_app(repository: ImageVersionRepository | None = None) -> Starlette:
     async def latest_versions(request: Request) -> Response:
         try:
             payload = await _read_json(request)
-            images = payload.get("images")
+            images = _required_non_empty_string_list(
+                payload,
+                "images",
+                error="invalid_images",
+                message="images must be an array of non-empty strings",
+            )
             versions = await service.latest_versions(images=images)
         except ValidationError as exc:
             return _json_error(status_code=400, error=exc.error, message=exc.message)
@@ -81,6 +94,27 @@ async def _read_json(request: Request) -> dict[str, Any]:
             message="request body must be a JSON object",
         )
     return payload
+
+
+def _required_non_empty_string(
+    payload: dict[str, Any], field: str, *, error: str, message: str
+) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(error=error, message=message)
+    return value
+
+
+def _required_non_empty_string_list(
+    payload: dict[str, Any], field: str, *, error: str, message: str
+) -> list[str]:
+    value = payload.get(field)
+    if not isinstance(value, list):
+        raise ValidationError(error=error, message=message)
+
+    if not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValidationError(error=error, message=message)
+    return value
 
 
 def _json_error(status_code: int, error: str, message: str) -> JSONResponse:

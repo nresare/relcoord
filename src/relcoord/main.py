@@ -10,6 +10,7 @@ from hypercorn.config import Config as HypercornConfig
 
 from relcoord.app import create_app
 from relcoord.config import Settings
+from relcoord.in_memory_repository import InMemoryImageVersionRepository
 
 DEFAULT_CONFIG_PATH = "relcoord.toml"
 
@@ -18,9 +19,10 @@ async def run(config_path: str) -> None:
     settings = Settings.from_toml(config_path)
     config = HypercornConfig()
     config.bind = [f"{settings.host}:{settings.port}"]
+    repository = InMemoryImageVersionRepository()
     # This has been raised upstream: https://github.com/pgjones/hypercorn/issues/353
     # noinspection PyTypeChecker
-    await serve(create_app(), config)  # ty: ignore[invalid-argument-type]
+    await serve(create_app(repository), config)  # ty: ignore[invalid-argument-type]
 
 
 @click.command()
