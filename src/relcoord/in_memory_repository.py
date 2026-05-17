@@ -2,44 +2,48 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
-from relcoord.errors import EquivalentVersionExistsError
+from datetime import datetime
+
+from relcoord.errors import TimestampConflictError
 from relcoord.models import RegisterResult, StoredVersion
 from relcoord.repository import ImageVersionRepository
-from relcoord.semver import SemanticVersion
 
 
 class InMemoryImageVersionRepository(ImageVersionRepository):
     def __init__(self) -> None:
         self._versions_by_image: dict[str, dict[str, StoredVersion]] = {}
-        self._precedence_index: dict[str, dict[tuple[object, ...], str]] = {}
+        self._timestamp_index: dict[str, dict[datetime, str]] = {}
 
     async def register(
-        self, image: str, semantic_version: SemanticVersion
+        self, image: str, version: str, timestamp: datetime
     ) -> RegisterResult:
         image_versions = self._versions_by_image.setdefault(image, {})
-        if semantic_version.original in image_versions:
+        if version in image_versions:
+            stored = image_versions[version]
             return RegisterResult(
-                image=image, version=semantic_version.original, created=False
+                image=image,
+                version=stored.version,
+                timestamp=stored.timestamp,
+                created=False,
             )
 
-        precedence_index = self._precedence_index.setdefault(image, {})
-        precedence_key = semantic_version.precedence_key()
-        existing_version = precedence_index.get(precedence_key)
+        timestamp_index = self._timestamp_index.setdefault(image, {})
+        existing_version = timestamp_index.get(timestamp)
         if existing_version is not None:
-            raise EquivalentVersionExistsError(
+            raise TimestampConflictError(
                 image=image,
                 existing_version=existing_version,
-                requested_version=semantic_version.original,
+                requested_version=version,
             )
 
-        image_versions[semantic_version.original] = StoredVersion(
+        image_versions[version] = StoredVersion(
             image=image,
-            version=semantic_version.original,
-            semantic_version=semantic_version,
+            version=version,
+            timestamp=timestamp,
         )
-        precedence_index[precedence_key] = semantic_version.original
+        timestamp_index[timestamp] = version
         return RegisterResult(
-            image=image, version=semantic_version.original, created=True
+            image=image, version=version, timestamp=timestamp, created=True
         )
 
     async def latest_for_image(self, image: str) -> str | None:
@@ -48,6 +52,6 @@ class InMemoryImageVersionRepository(ImageVersionRepository):
             return None
         latest = max(
             image_versions.values(),
-            key=lambda stored: stored.semantic_version,
+            key=lambda stored: stored.timestamp,
         )
         return latest.version

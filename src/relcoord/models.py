@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
-
-from relcoord.semver import SemanticVersion
 
 
 @dataclass(frozen=True)
 class StoredVersion:
     image: str
     version: str
-    semantic_version: SemanticVersion
+    timestamp: datetime
 
 
 @dataclass(frozen=True)
 class RegisterResult:
     image: str
     version: str
+    timestamp: datetime
     created: bool
 
 

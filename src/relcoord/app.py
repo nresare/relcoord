@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from starlette.applications import Starlette
@@ -9,7 +10,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from relcoord.errors import EquivalentVersionExistsError, ValidationError
+from relcoord.errors import TimestampConflictError, ValidationError
 from relcoord.repository import ImageVersionRepository
 from relcoord.service import ImageVersionService
 
@@ -35,13 +36,21 @@ def create_app(repository: ImageVersionRepository) -> Starlette:
                 error="invalid_version",
                 message="version must be a non-empty string",
             )
-            result = await service.register_version(image=image, version=version)
+            timestamp = payload["timestamp"] if "timestamp" in payload else None
+            if "timestamp" in payload and timestamp is None:
+                raise ValidationError(
+                    error="invalid_timestamp",
+                    message="timestamp must be a valid RFC 3339 timestamp with timezone",
+                )
+            result = await service.register_version(
+                image=image, version=version, timestamp=timestamp
+            )
         except ValidationError as exc:
             return _json_error(status_code=400, error=exc.error, message=exc.message)
-        except EquivalentVersionExistsError as exc:
+        except TimestampConflictError as exc:
             return _json_error(
-                status_code=409,
-                error="conflicting_version",
+                status_code=400,
+                error="timestamp_conflict",
                 message=str(exc),
             )
 
@@ -50,6 +59,7 @@ def create_app(repository: ImageVersionRepository) -> Starlette:
             {
                 "image": result.image,
                 "version": result.version,
+                "timestamp": _format_timestamp(result.timestamp),
                 "created": result.created,
             },
             status_code=status_code,
@@ -122,3 +132,7 @@ def _json_error(status_code: int, error: str, message: str) -> JSONResponse:
         {"error": error, "message": message},
         status_code=status_code,
     )
+
+
+def _format_timestamp(timestamp: datetime) -> str:
+    return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")

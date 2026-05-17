@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
+from datetime import datetime
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -23,7 +25,11 @@ def test_healthz(client: TestClient) -> None:
 def test_register_and_resolve_latest_version(client: TestClient) -> None:
     created = client.post(
         "/v1/image-versions",
-        json={"image": "registry.example.com/team/api", "version": "1.2.3"},
+        json={
+            "image": "registry.example.com/team/api",
+            "version": "1.2.3",
+            "timestamp": "2026-05-17T10:15:30+00:00",
+        },
     )
     latest = client.post(
         "/v1/images/latest",
@@ -39,6 +45,7 @@ def test_register_and_resolve_latest_version(client: TestClient) -> None:
     assert created.json() == {
         "image": "registry.example.com/team/api",
         "version": "1.2.3",
+        "timestamp": "2026-05-17T10:15:30Z",
         "created": True,
     }
     assert latest.status_code == 200
@@ -50,17 +57,18 @@ def test_register_and_resolve_latest_version(client: TestClient) -> None:
     }
 
 
-def test_reject_invalid_version(client: TestClient) -> None:
+def test_register_accepts_opaque_version(client: TestClient) -> None:
     response = client.post(
         "/v1/image-versions",
-        json={"image": "registry.example.com/team/api", "version": "not-semver"},
+        json={"image": "registry.example.com/team/api", "version": "release-2026-05-17"},
     )
 
-    assert response.status_code == 400
-    assert response.json() == {
-        "error": "invalid_version",
-        "message": "version must be valid Semantic Versioning 2.0.0",
-    }
+    body = response.json()
+    assert response.status_code == 201
+    assert body["image"] == "registry.example.com/team/api"
+    assert body["version"] == "release-2026-05-17"
+    assert body["created"] is True
+    assert datetime.fromisoformat(body["timestamp"].replace("Z", "+00:00"))
 
 
 @pytest.mark.parametrize(
@@ -124,16 +132,44 @@ def test_reject_invalid_latest_request_fields(
     }
 
 
-def test_reject_build_metadata_only_variant(client: TestClient) -> None:
+@pytest.mark.parametrize("timestamp", ["not-a-timestamp", "2026-05-17T10:15:30", None])
+def test_reject_invalid_timestamp(
+    client: TestClient, timestamp: str | None
+) -> None:
+    response = client.post(
+        "/v1/image-versions",
+        json={
+            "image": "registry.example.com/team/api",
+            "version": "1.2.3",
+            "timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "invalid_timestamp",
+        "message": "timestamp must be a valid RFC 3339 timestamp with timezone",
+    }
+
+
+def test_reject_timestamp_conflict(client: TestClient) -> None:
     first = client.post(
         "/v1/image-versions",
-        json={"image": "registry.example.com/team/api", "version": "1.2.3+build1"},
+        json={
+            "image": "registry.example.com/team/api",
+            "version": "1.2.3",
+            "timestamp": "2026-05-17T10:15:30Z",
+        },
     )
     second = client.post(
         "/v1/image-versions",
-        json={"image": "registry.example.com/team/api", "version": "1.2.3+build2"},
+        json={
+            "image": "registry.example.com/team/api",
+            "version": "2.0.0",
+            "timestamp": "2026-05-17T10:15:30Z",
+        },
     )
 
     assert first.status_code == 201
-    assert second.status_code == 409
-    assert second.json()["error"] == "conflicting_version"
+    assert second.status_code == 400
+    assert second.json()["error"] == "timestamp_conflict"

@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Iterable, Optional
 
 from relcoord.models import RegisterResult
-from relcoord.semver import SemanticVersion
 
 
 class ImageVersionRepository(ABC):
     @abstractmethod
     async def register(
-        self, image: str, semantic_version: SemanticVersion
+        self, image: str, version: str, timestamp: datetime
     ) -> RegisterResult:
         raise NotImplementedError
 
