@@ -6,16 +6,16 @@ Draft MVP interface definition.
 
 ## Summary
 
-This document defines the external interface of a small HTTP service that keeps track of known versions for container images and returns the highest known version for each image according to the [Semantic Versioning 2.0.0](https://semver.org/) ordering rules.
+This document defines the external interface of a small HTTP service that keeps track of known versions for container images and returns the latest known version for each image according to a timestamp stored with each image/version pair.
 
 The purpose of this service is to remove the need to create configuration-only pull requests when deploying a newly built software version. Instead of checking image tag updates into the same git-managed configuration repository used by `manifest-builder`, `manifest-builder` will query this service at manifest generation time.
 
-For the first iteration, the service has no concept of environments, promotion, deployment history, or test results. It only stores known versions for images and answers "what is the latest known version?".
+For the first iteration, the service has no concept of environments, promotion, deployment history, or test results. It only stores known versions for images, records when each version became known, and answers "what is the latest known version?".
 
 ## Goals
 
 - Allow external systems to register that a specific version exists for a specific image.
-- Return the highest known version for a given image using SemVer comparison rules.
+- Return the latest known version for a given image using the stored timestamp for each image/version pair.
 - Return latest versions for multiple images in one request so `manifest-builder` can resolve all required tags efficiently.
 - Keep the interface small and stable.
 - Preserve a clean path toward future policy-based selection, such as promotion based on deployment and test outcomes.
@@ -25,7 +25,6 @@ For the first iteration, the service has no concept of environments, promotion, 
 - Environment-specific version selection.
 - Automated promotion or rollout policy.
 - Tracking deployments, test executions, or release eligibility.
-- Support for non-SemVer ordering in the MVP.
 - Image discovery from container registries in the MVP.
 
 ## Context
@@ -42,7 +41,7 @@ This interface splits those responsibilities:
 The service has two required responsibilities:
 
 1. Accept that a specific version of a specific image exists.
-2. Return the highest known version for one or more images using SemVer precedence rules.
+2. Store a timestamp for each image/version pair and return the version with the latest timestamp for one or more images.
 
 ## API
 
@@ -59,9 +58,12 @@ Request:
 ```json
 {
   "image": "registry.example.com/payments/api",
-  "version": "1.4.2"
+  "version": "1.4.2",
+  "timestamp": "2026-05-17T10:15:30Z"
 }
 ```
+
+`timestamp` is optional. If it is omitted, the service records the time at which it handles the registration request.
 
 Response when the version was newly recorded:
 
@@ -69,6 +71,7 @@ Response when the version was newly recorded:
 {
   "image": "registry.example.com/payments/api",
   "version": "1.4.2",
+  "timestamp": "2026-05-17T10:15:30Z",
   "created": true
 }
 ```
@@ -79,6 +82,7 @@ Response when the version was already known:
 {
   "image": "registry.example.com/payments/api",
   "version": "1.4.2",
+  "timestamp": "2026-05-17T10:15:30Z",
   "created": false
 }
 ```
@@ -87,6 +91,7 @@ Behavior:
 
 - The operation is idempotent.
 - Re-registering the same `(image, version)` pair is successful and returns `created: false`.
+- Re-registering an existing `(image, version)` pair does not change its stored timestamp.
 - The service must reject invalid requests as described in the validation section.
 
 ### Get the latest known versions for images
@@ -149,7 +154,14 @@ Response:
 
 - Required.
 - Must be a non-empty string.
-- Must be valid Semantic Versioning 2.0.0.
+- Treated as an opaque version or tag identifier.
+
+### Timestamp field
+
+- Optional for `POST /v1/image-versions`.
+- If supplied, must be a valid RFC 3339 timestamp with an explicit timezone offset.
+- If omitted, the service must use the current time of the registration call.
+- Stored timestamps should be normalized to UTC in responses.
 
 ### Images list
 
@@ -157,21 +169,11 @@ Response:
 - Must be a JSON array of non-empty strings.
 - Duplicate image names may be accepted, but the response must contain each image at most once.
 
-## Version Ordering Rules
+## Timestamp Selection Rules
 
-Version ordering must follow [semver.org](https://semver.org/) exactly:
+The latest version for an image is the version whose image/version record has the greatest stored timestamp.
 
-- Higher `major`, then `minor`, then `patch` wins.
-- Pre-release versions sort lower than the associated normal release.
-- Build metadata does not affect precedence.
-
-Examples:
-
-- `1.2.0` > `1.1.99`
-- `1.2.0` > `1.2.0-rc.1`
-- `1.2.0+build5` has the same precedence as `1.2.0+build7`
-
-Because build metadata does not affect precedence, equal-precedence version strings need explicit service behavior. For the MVP, the service should reject registration of a second version string for the same image if it differs only by build metadata from an already-known version with equal precedence.
+If multiple versions for the same image have the same timestamp, the service must return a deterministic result. The MVP should avoid relying on tie-breaking behavior by treating equal timestamps for different versions of the same image as an invalid registration conflict.
 
 ## Response Semantics
 
@@ -179,10 +181,11 @@ Because build metadata does not affect precedence, equal-precedence version stri
 
 - If the image/version pair was not previously known, the service returns success with `created: true`.
 - If the image/version pair was already known, the service returns success with `created: false`.
+- Registration responses include the timestamp stored for the image/version pair.
 
 ### Latest-version responses
 
-- If an image has one or more known versions, the response contains the highest-precedence version string for that image.
+- If an image has one or more known versions, the response contains the version string with the latest stored timestamp for that image.
 - If an image has no known versions, the response contains `null` for that image.
 
 ## Error Handling
@@ -192,15 +195,15 @@ Recommended response behavior:
 - `200 OK` for successful reads.
 - `200 OK` for idempotent duplicate registration with `created: false`.
 - `201 Created` for first-time registration if the implementation wants to distinguish creation.
-- `400 Bad Request` for malformed JSON, missing fields, or invalid SemVer.
+- `400 Bad Request` for malformed JSON, missing fields, invalid timestamps, or timestamp conflicts.
 - `500 Internal Server Error` for unexpected failures.
 
-Example invalid version response:
+Example invalid timestamp response:
 
 ```json
 {
-  "error": "invalid_version",
-  "message": "version must be valid Semantic Versioning 2.0.0"
+  "error": "invalid_timestamp",
+  "message": "timestamp must be a valid RFC 3339 timestamp with timezone"
 }
 ```
 
@@ -226,7 +229,7 @@ Future additions could include:
 - deployment history per environment
 - automated test result ingestion
 - promotion rules such as "eligible for staging after successful deployment in dev"
-- policy-based selection that returns the best eligible version rather than simply the highest known version
+- policy-based selection that returns the best eligible version rather than simply the latest known version
 
 The MVP should keep this interface stable unless those future capabilities require additional endpoints.
 
@@ -234,4 +237,4 @@ The MVP should keep this interface stable unless those future capabilities requi
 
 - Should `manifest-builder` fail hard when an image has no known version, or should it allow local fallback rules?
 - Which component is responsible for calling the registration endpoint: CI, a release job, or some registry-watching process?
-- Is there any existing image tagging behavior that is not strict SemVer and would need to be normalized before using this service?
+- Should latest-version responses include the selected timestamp as well as the version string?

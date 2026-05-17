@@ -15,7 +15,6 @@ The intent is to keep [version-service-design.md](/Users/noa/fun/relcoord/docs/v
 | Web framework | Starlette | ASGI application framework |
 | Server | Embedded Hypercorn | Run Hypercorn in-process rather than as an external runtime dependency |
 | Persistence | SurrealDB | Existing SurrealDB instance in the Kubernetes cluster |
-| SemVer library | TBD | Choose a library with SemVer 2.0.0 compliant ordering |
 | Dependency management | uv | Use `uv` for local development, dependency management, and reproducible environments |
 | Packaging | Python wheel | Build and distribute the service as a wheel |
 | Deployment model | Kubernetes | Expected to run in-cluster |
@@ -49,15 +48,18 @@ The intent is to keep [version-service-design.md](/Users/noa/fun/relcoord/docs/v
 - Persistence logic should be designed around a remote database rather than local embedded storage.
 - Startup and runtime behavior should assume database connectivity to an existing in-cluster SurrealDB instance.
 - The implementation should define how uniqueness and idempotency are enforced in SurrealDB for `(image, version)`.
+- Each `(image, version)` record should store a timestamp.
+- When registration omits a timestamp, the application should assign the current call time before persisting the record.
 
 ## Choices Still To Make
 
-### SemVer library
+### Timestamp handling
 
 Questions:
 
-- Which Python library should be the source of truth for SemVer 2.0.0 validation and ordering?
-- Does the chosen library handle pre-release and build metadata exactly as required?
+- Should the application or SurrealDB be the source of truth for the default registration timestamp?
+- Which Python type and parser should be used for RFC 3339 timestamp validation?
+- How should the service handle clock skew between callers that supply timestamps and callers that omit them?
 
 Decision:
 
@@ -73,7 +75,8 @@ Questions:
 
 - Should versions be stored as one record per `(image, version)` pair?
 - Should image names be stored as raw fields, normalized identifiers, or both?
-- How should equal-precedence versions that differ only by build metadata be detected and rejected?
+- How should timestamp conflicts be detected and rejected when different versions for the same image use the same timestamp?
+- Which index should support resolving the latest version for an image efficiently?
 
 Decision:
 
@@ -151,7 +154,7 @@ Questions:
 
 - Which levels of testing are required for the MVP?
 - Do we want integration tests against a real or containerized SurrealDB instance?
-- Should SemVer edge cases be covered with parametrized `pytest` tests?
+- Should timestamp parsing, defaulting, and conflict behavior be covered with parametrized `pytest` tests?
 
 Decision:
 
@@ -159,13 +162,13 @@ Decision:
 
 Notes:
 
-- Prefer a mix of unit tests for SemVer and request validation behavior, plus targeted integration tests around persistence and API flows.
+- Prefer a mix of unit tests for timestamp handling and request validation behavior, plus targeted integration tests around persistence and API flows.
 
 ## Suggested Next Decisions
 
 If we want to unblock implementation quickly, the highest-value remaining choices are:
 
-1. SemVer library
+1. Timestamp validation and defaulting approach
 2. Request validation approach
 3. SurrealDB record layout and uniqueness strategy
 4. Observability defaults
