@@ -2,6 +2,7 @@
 
 host = "0.0.0.0"
 port = 8080
+manifests-repository = "https://github.com/example/manifests.git"
 
 [persistence]
 uri = "ws://localhost:8000"

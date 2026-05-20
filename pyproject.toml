@@ -15,6 +15,7 @@ dependencies = [
   "dulwich>=1.2.1,<2.0.0",
   "httpx>=0.28.1,<1.0.0",
   "hypercorn>=0.17.3,<1.0.0",
+  "manifest-builder>=0.4.1.dev23,<1.0.0",
   "pyjwt[crypto]>=2.9.0,<3.0.0",
   "starlette>=0.48.0,<1.0.0",
   "surrealdb>=2.0.0,<3.0.0",

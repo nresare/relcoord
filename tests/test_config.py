@@ -40,6 +40,29 @@ def test_settings_parse_surrealdb_idmouse_config(tmp_path: Path) -> None:
     assert settings.persistence.idmouse.bearer_token() == "local-bearer-token"
 
 
+def test_settings_parses_manifests_repository(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        manifests-repository = "https://github.com/acme/manifests.git"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.manifests_repository == "https://github.com/acme/manifests.git"
+
+
+def test_settings_rejects_empty_manifests_repository(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('manifests-repository = ""\n')
+
+    with pytest.raises(
+        ValueError, match="manifests-repository must be a non-empty string"
+    ):
+        Settings.from_toml(config)
+
+
 def test_settings_rejects_old_idmouse_token_path_key(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     token_file = tmp_path / "idmouse-token"

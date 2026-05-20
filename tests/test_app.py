@@ -7,6 +7,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from relcoord.app import create_app
+from relcoord.change import DeployConfigError
 from relcoord.in_memory_store import InMemoryImageInfoStore
 
 
@@ -204,6 +205,56 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
         "repo": "acme/config",
         "commit": "deadbeef",
         "registered": None,
+    }
+
+
+def test_change_processes_deploy_config_when_processor_is_configured() -> None:
+    class Processor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def process(self, repo: str, commit: str) -> object:
+            self.calls.append((repo, commit))
+            return type("Result", (), {"generated_count": 3})()
+
+    processor = Processor()
+    client = TestClient(
+        create_app(InMemoryImageInfoStore(), change_processor=processor)
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 202
+    assert processor.calls == [("https://github.com/acme/config.git", "deadbeef")]
+    assert response.json() == {
+        "repo": "https://github.com/acme/config.git",
+        "commit": "deadbeef",
+        "registered": None,
+        "processed": {"generated": 3},
+    }
+
+
+def test_change_reports_missing_deploy_config() -> None:
+    class Processor:
+        def process(self, repo: str, commit: str) -> object:
+            raise DeployConfigError("missing .deploy")
+
+    client = TestClient(
+        create_app(InMemoryImageInfoStore(), change_processor=Processor())
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "invalid_deploy_config",
+        "message": "missing .deploy",
     }
 
 

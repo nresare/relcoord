@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from time import perf_counter
-from typing import Any
+from typing import Any, Protocol
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -15,6 +16,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from relcoord.auth import AuthError, TokenValidator, extract_bearer_token
+from relcoord.change import ChangeProcessingError, DeployConfigError
 from relcoord.errors import TimestampConflictError, ValidationError
 from relcoord.service import ImageVersionService
 from relcoord.store import ImageInfoStore
@@ -22,9 +24,14 @@ from relcoord.store import ImageInfoStore
 logger = logging.getLogger(__name__)
 
 
+class ChangeProcessor(Protocol):
+    def process(self, repo: str, commit: str) -> object: ...
+
+
 def create_app(
     store: ImageInfoStore,
     token_validator: TokenValidator | None = None,
+    change_processor: ChangeProcessor | None = None,
 ) -> Starlette:
     service = ImageVersionService(store=store)
 
@@ -104,6 +111,10 @@ def create_app(
                     "timestamp": _format_timestamp(result.timestamp),
                     "created": result.created,
                 }
+            processed = None
+            if change_processor is not None:
+                result = await asyncio.to_thread(change_processor.process, repo, commit)
+                processed = _change_result_payload(result)
         except ValidationError as exc:
             return _json_error(status_code=400, error=exc.error, message=exc.message)
         except TimestampConflictError as exc:
@@ -112,12 +123,31 @@ def create_app(
                 error="timestamp_conflict",
                 message=str(exc),
             )
+        except DeployConfigError as exc:
+            return _json_error(
+                status_code=400,
+                error="invalid_deploy_config",
+                message=str(exc),
+            )
+        except ChangeProcessingError as exc:
+            logger.exception(
+                "Failed to process change for repo %s at commit %s", repo, commit
+            )
+            return _json_error(
+                status_code=500,
+                error="change_processing_failed",
+                message=str(exc),
+            )
 
         logger.info("Accepted change for repo %s at commit %s", repo, commit)
-        return JSONResponse(
-            {"repo": repo, "commit": commit, "registered": registered},
-            status_code=202,
-        )
+        body: dict[str, Any] = {
+            "repo": repo,
+            "commit": commit,
+            "registered": registered,
+        }
+        if change_processor is not None:
+            body["processed"] = processed
+        return JSONResponse(body, status_code=202)
 
     async def latest_versions(request: Request) -> Response:
         try:
@@ -221,3 +251,8 @@ def _json_error(status_code: int, error: str, message: str) -> JSONResponse:
 
 def _format_timestamp(timestamp: datetime) -> str:
     return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _change_result_payload(result: object) -> dict[str, Any]:
+    generated_count = getattr(result, "generated_count", None)
+    return {"generated": generated_count}
