@@ -43,6 +43,12 @@ def create_app(
             token = extract_bearer_token(header)
             token_validator.validate(token)
         except AuthError as exc:
+            logger.warning(
+                "Unauthorized request %s %s: %s",
+                request.method,
+                request.url.path,
+                exc,
+            )
             return _json_error(status_code=401, error="unauthorized", message=str(exc))
         return None
 

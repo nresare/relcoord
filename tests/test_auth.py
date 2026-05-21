@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -198,6 +199,38 @@ def test_validator_rejects_wrong_audience(private_pem: str, signing_key: PyJWK) 
 
     with pytest.raises(AuthError):
         validator.validate(token)
+
+
+def test_validator_logs_wrong_audience(
+    private_pem: str, signing_key: PyJWK, caplog: pytest.LogCaptureFixture
+) -> None:
+    validator = _make_validator([_role()], signing_key)
+    token = _make_token(private_pem, audience="other")
+
+    with caplog.at_level(logging.WARNING, logger="relcoord.auth"):
+        with pytest.raises(AuthError):
+            validator.validate(token)
+
+    assert "audience validation failed" in caplog.text
+    assert "aud='other'" in caplog.text
+
+
+def test_validator_logs_signature_validation_failure(
+    signing_key: PyJWK, caplog: pytest.LogCaptureFixture
+) -> None:
+    other_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other_private_pem = other_private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    validator = _make_validator([_role()], signing_key)
+
+    with caplog.at_level(logging.WARNING, logger="relcoord.auth"):
+        with pytest.raises(AuthError):
+            validator.validate(_make_token(other_private_pem))
+
+    assert "signature validation failed" in caplog.text
 
 
 def test_validator_rejects_when_required_claim_missing(

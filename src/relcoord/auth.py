@@ -2,13 +2,27 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 import jwt
-from jwt import InvalidTokenError, PyJWKClient, PyJWKClientError
+from jwt import (
+    DecodeError,
+    ExpiredSignatureError,
+    ImmatureSignatureError,
+    InvalidAlgorithmError,
+    InvalidAudienceError,
+    InvalidIssuedAtError,
+    InvalidIssuerError,
+    InvalidSignatureError,
+    InvalidTokenError,
+    MissingRequiredClaimError,
+    PyJWKClient,
+    PyJWKClientError,
+)
 
 DEFAULT_ALGORITHMS: tuple[str, ...] = ("RS256",)
 KUBERNETES_SERVICE_HOST = "https://kubernetes.default.svc"
@@ -30,6 +44,8 @@ ALLOWED_ALGORITHMS: frozenset[str] = frozenset(
         "EdDSA",
     }
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AuthError(Exception):
@@ -116,6 +132,7 @@ class TokenValidator:
         if not bearer_token:
             raise AuthError("empty bearer token")
         last_error: Exception | None = None
+        token_summary = _token_summary(bearer_token)
         for role in self._roles:
             client = self._clients[role.name]
             try:
@@ -130,12 +147,28 @@ class TokenValidator:
                 )
             except (InvalidTokenError, PyJWKClientError) as exc:
                 last_error = exc
+                logger.warning(
+                    "Bearer token rejected for role '%s': %s (%s)",
+                    role.name,
+                    _auth_failure_reason(exc),
+                    token_summary,
+                )
                 continue
-            if not _claims_match(claims, role.claims):
+            claim_mismatches = _claim_mismatches(claims, role.claims)
+            if claim_mismatches:
                 last_error = AuthError(
                     f"required claims for role '{role.name}' do not match"
                 )
+                logger.warning(
+                    "Bearer token rejected for role '%s': required claims do not match: %s (%s)",
+                    role.name,
+                    ", ".join(claim_mismatches),
+                    token_summary,
+                )
                 continue
+            logger.info(
+                "Bearer token accepted for role '%s' (%s)", role.name, token_summary
+            )
             return ValidatedClaims(role=role.name, claims=claims)
         raise AuthError(
             f"token did not validate against any configured role: {last_error}"
@@ -153,11 +186,75 @@ def extract_bearer_token(authorization_header: str | None) -> str:
     return token
 
 
-def _claims_match(token_claims: dict[str, Any], required: dict[str, str]) -> bool:
+def _claim_mismatches(
+    token_claims: dict[str, Any], required: dict[str, str]
+) -> list[str]:
+    mismatches = []
     for key, expected in required.items():
-        if token_claims.get(key) != expected:
-            return False
-    return True
+        actual = token_claims.get(key)
+        if actual != expected:
+            mismatches.append(
+                f"{key} expected {_preview(expected)} got {_preview(actual)}"
+            )
+    return mismatches
+
+
+def _token_summary(token: str) -> str:
+    try:
+        header = jwt.get_unverified_header(token)
+    except DecodeError:
+        header = {}
+    try:
+        claims = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_iat": False,
+                "verify_nbf": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+    except DecodeError:
+        claims = {}
+    parts = [
+        f"alg={_preview(header.get('alg'))}",
+        f"kid={_preview(header.get('kid'))}",
+        f"iss={_preview(claims.get('iss'))}",
+        f"aud={_preview(claims.get('aud'))}",
+        f"sub={_preview(claims.get('sub'))}",
+    ]
+    return "token " + " ".join(parts)
+
+
+def _auth_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, PyJWKClientError):
+        return f"signing key lookup failed: {exc}"
+    if isinstance(exc, InvalidAudienceError):
+        return f"audience validation failed: {exc}"
+    if isinstance(exc, InvalidIssuerError):
+        return f"issuer validation failed: {exc}"
+    if isinstance(exc, InvalidSignatureError):
+        return f"signature validation failed: {exc}"
+    if isinstance(exc, ExpiredSignatureError):
+        return f"token is expired: {exc}"
+    if isinstance(exc, ImmatureSignatureError):
+        return f"token is not yet valid: {exc}"
+    if isinstance(exc, InvalidIssuedAtError):
+        return f"issued-at validation failed: {exc}"
+    if isinstance(exc, MissingRequiredClaimError):
+        return f"required claim is missing: {exc}"
+    if isinstance(exc, InvalidAlgorithmError):
+        return f"algorithm validation failed: {exc}"
+    return f"token validation failed: {exc}"
+
+
+def _preview(value: object, *, limit: int = 80) -> str:
+    text = repr(value)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
 
 
 def _jwks_uri_for_role(role: RoleConfig) -> str:
