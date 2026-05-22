@@ -249,13 +249,16 @@ def test_validator_reuses_cached_signing_key_for_token_key_id(
     private_pem: str, signing_key: PyJWK
 ) -> None:
     token = _make_token(private_pem, key_id="key-1")
-    validator = _make_validator([_role()], signing_key)
-    client = validator._clients["https://issuer.example.com"]
+    with patch("relcoord.auth.PyJWKClient") as mock_cls:
+        mock_client = MagicMock()
+        mock_client.get_signing_key_from_jwt.return_value = signing_key
+        mock_cls.return_value = mock_client
+        validator = TokenValidator([_role()])
 
     validator.validate(token)
     validator.validate(token)
 
-    client.get_signing_key_from_jwt.assert_called_once_with(token)
+    mock_client.get_signing_key_from_jwt.assert_called_once_with(token)
 
 
 def test_signing_key_cache_expires_after_ttl(signing_key: PyJWK) -> None:
