@@ -28,7 +28,6 @@ name = "kubernetes-default"
 audience = "relcoord"
 issuer = "https://kubernetes.default.svc"
 jwks-uri = "https://kubernetes.default.svc/openid/v1/jwks"
-algorithms = ["RS256"]
 
 [role.claims]
 sub = "system:serviceaccount:default:default"

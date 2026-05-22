@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 import jwt
+from jwt import algorithms
 from jwt import (
     DecodeError,
     ExpiredSignatureError,
@@ -20,29 +23,21 @@ from jwt import (
     InvalidSignatureError,
     InvalidTokenError,
     MissingRequiredClaimError,
+    PyJWK,
     PyJWKClient,
     PyJWKClientError,
 )
+from jwt.algorithms import HMACAlgorithm, NoneAlgorithm
 
-DEFAULT_ALGORITHMS: tuple[str, ...] = ("RS256",)
 KUBERNETES_SERVICE_HOST = "https://kubernetes.default.svc"
 KUBERNETES_CA_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 KUBERNETES_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
-ALLOWED_ALGORITHMS: frozenset[str] = frozenset(
-    {
-        "HS256",
-        "HS384",
-        "HS512",
-        "RS256",
-        "RS384",
-        "RS512",
-        "PS256",
-        "PS384",
-        "PS512",
-        "ES256",
-        "ES384",
-        "EdDSA",
-    }
+SIGNING_KEY_CACHE_MAX_SIZE = 32
+SIGNING_KEY_CACHE_TTL_SECONDS = 3600
+PUBLIC_KEY_ALGORITHMS: tuple[str, ...] = tuple(
+    name
+    for name, algorithm in algorithms.get_default_algorithms().items()
+    if not isinstance(algorithm, HMACAlgorithm | NoneAlgorithm)
 )
 
 logger = logging.getLogger(__name__)
@@ -58,7 +53,6 @@ class RoleConfig:
     audience: str
     issuer: str
     jwks_uri: str | None = None
-    algorithms: tuple[str, ...] = DEFAULT_ALGORITHMS
     claims: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -69,16 +63,6 @@ class RoleConfig:
         jwks_uri = _optional_string(
             data, "jwks-uri", context=f"role '{name}'", alias="jwks_uri"
         )
-        algorithms_value = data.get("algorithms", list(DEFAULT_ALGORITHMS))
-        if not isinstance(algorithms_value, list) or not algorithms_value:
-            raise ValueError(
-                f"role '{name}' algorithms must be a non-empty array of strings"
-            )
-        algorithms: list[str] = []
-        for entry in algorithms_value:
-            if not isinstance(entry, str) or entry not in ALLOWED_ALGORITHMS:
-                raise ValueError(f"role '{name}' algorithm '{entry}' is not supported")
-            algorithms.append(entry)
 
         raw_claims = data.get("claims", {})
         if not isinstance(raw_claims, dict):
@@ -97,7 +81,6 @@ class RoleConfig:
             audience=audience,
             issuer=issuer,
             jwks_uri=jwks_uri,
-            algorithms=tuple(algorithms),
             claims=claims,
         )
 
@@ -113,34 +96,102 @@ class ValidatedClaims:
         return sub if isinstance(sub, str) else ""
 
 
+@dataclass(frozen=True)
+class _CachedSigningKey:
+    key: PyJWK
+    expires_at: float
+
+
+class _SigningKeyCache:
+    def __init__(
+        self,
+        *,
+        max_size: int = SIGNING_KEY_CACHE_MAX_SIZE,
+        ttl_seconds: int = SIGNING_KEY_CACHE_TTL_SECONDS,
+    ) -> None:
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._entries: OrderedDict[tuple[str, str, str], _CachedSigningKey] = (
+            OrderedDict()
+        )
+
+    def get(self, cache_key: tuple[str, str, str]) -> PyJWK | None:
+        now = time.monotonic()
+        entry = self._entries.get(cache_key)
+        if entry is None:
+            return None
+        if entry.expires_at <= now:
+            del self._entries[cache_key]
+            return None
+        self._entries.move_to_end(cache_key)
+        return entry.key
+
+    def set(self, cache_key: tuple[str, str, str], signing_key: PyJWK) -> None:
+        if self._max_size <= 0:
+            return
+        self._entries[cache_key] = _CachedSigningKey(
+            key=signing_key,
+            expires_at=time.monotonic() + self._ttl_seconds,
+        )
+        self._entries.move_to_end(cache_key)
+        while len(self._entries) > self._max_size:
+            self._entries.popitem(last=False)
+
+
 class TokenValidator:
     def __init__(self, roles: list[RoleConfig]) -> None:
         if not roles:
             raise ValueError("TokenValidator requires at least one role")
         seen: set[str] = set()
+        roles_by_issuer: dict[str, list[RoleConfig]] = {}
         for role in roles:
             if role.name in seen:
                 raise ValueError(f"duplicate role '{role.name}'")
             seen.add(role.name)
+            roles_by_issuer.setdefault(role.issuer, []).append(role)
         self._roles = list(roles)
+        self._roles_by_issuer = roles_by_issuer
         self._clients: dict[str, PyJWKClient] = {
-            role.name: PyJWKClient(_jwks_uri_for_role(role), cache_keys=True)
-            for role in roles
+            issuer: PyJWKClient(_jwks_uri_for_issuer(issuer_roles), cache_keys=False)
+            for issuer, issuer_roles in roles_by_issuer.items()
         }
+        self._signing_key_cache = _SigningKeyCache()
 
     def validate(self, bearer_token: str) -> ValidatedClaims:
         if not bearer_token:
             raise AuthError("empty bearer token")
         last_error: Exception | None = None
         token_summary = _token_summary(bearer_token)
-        for role in self._roles:
-            client = self._clients[role.name]
+        issuer = _unverified_issuer(bearer_token)
+        if issuer not in self._roles_by_issuer:
+            raise AuthError(
+                f"token did not include a configured issuer: {token_summary}"
+            )
+        roles = self._roles_by_issuer[issuer]
+        client = self._clients[issuer]
+        try:
+            signing_key = self._signing_key_for_token(
+                client=client,
+                issuer=issuer,
+                bearer_token=bearer_token,
+            )
+        except PyJWKClientError as exc:
+            logger.warning(
+                "Bearer token rejected for issuer '%s': %s (%s)",
+                issuer,
+                _auth_failure_reason(exc),
+                token_summary,
+            )
+            raise AuthError(
+                f"token did not validate against configured issuer '{issuer}': {exc}"
+            ) from exc
+
+        for role in roles:
             try:
-                signing_key = client.get_signing_key_from_jwt(bearer_token)
                 claims = jwt.decode(
                     bearer_token,
                     key=signing_key.key,
-                    algorithms=list(role.algorithms),
+                    algorithms=list(PUBLIC_KEY_ALGORITHMS),
                     audience=role.audience,
                     issuer=role.issuer,
                     options={"require": ["exp", "iat", "iss", "aud"]},
@@ -173,6 +224,20 @@ class TokenValidator:
         raise AuthError(
             f"token did not validate against any configured role: {last_error}"
         )
+
+    def _signing_key_for_token(
+        self, *, client: PyJWKClient, issuer: str, bearer_token: str
+    ) -> PyJWK:
+        cache_key = _signing_key_cache_key(issuer, bearer_token)
+        if cache_key is not None:
+            cached_key = self._signing_key_cache.get(cache_key)
+            if cached_key is not None:
+                return cached_key
+
+        signing_key = client.get_signing_key_from_jwt(bearer_token)
+        if cache_key is not None:
+            self._signing_key_cache.set(cache_key, signing_key)
+        return signing_key
 
 
 def extract_bearer_token(authorization_header: str | None) -> str:
@@ -226,6 +291,37 @@ def _token_summary(token: str) -> str:
         f"sub={_preview(claims.get('sub'))}",
     ]
     return "token " + " ".join(parts)
+
+
+def _unverified_issuer(token: str) -> str | None:
+    try:
+        claims = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_iat": False,
+                "verify_nbf": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+    except InvalidTokenError:
+        return None
+    issuer = claims.get("iss")
+    return issuer if isinstance(issuer, str) else None
+
+
+def _signing_key_cache_key(issuer: str, token: str) -> tuple[str, str, str] | None:
+    try:
+        header = jwt.get_unverified_header(token)
+    except DecodeError:
+        return None
+    algorithm = header.get("alg")
+    key_id = header.get("kid")
+    if not isinstance(algorithm, str) or not isinstance(key_id, str):
+        return None
+    return issuer, key_id, algorithm
 
 
 def _auth_failure_reason(exc: Exception) -> str:
@@ -285,6 +381,17 @@ def _jwks_uri_for_role(role: RoleConfig) -> str:
             f"OpenID configuration for role '{role.name}' must include jwks_uri"
         )
     return jwks_uri
+
+
+def _jwks_uri_for_issuer(roles: list[RoleConfig]) -> str:
+    explicit_uris = {role.jwks_uri for role in roles if role.jwks_uri is not None}
+    if len(explicit_uris) > 1:
+        raise ValueError(
+            f"roles for issuer '{roles[0].issuer}' must use the same jwks-uri"
+        )
+    if explicit_uris:
+        return next(iter(explicit_uris))
+    return _jwks_uri_for_role(roles[0])
 
 
 def _get_openid_configuration(issuer: str, url: str) -> httpx.Response:

@@ -112,7 +112,7 @@ def test_settings_parses_role_entries(tmp_path: Path) -> None:
     assert settings.roles[0].name == "kubernetes-default"
     assert settings.roles[0].jwks_uri == "https://kubernetes.default.svc/openid/v1/jwks"
     assert settings.roles[0].claims == {"sub": "system:serviceaccount:default:default"}
-    assert settings.roles[1].algorithms == ("RS256", "ES256")
+    assert not hasattr(settings.roles[1], "algorithms")
 
 
 def test_settings_parses_idcat_config(tmp_path: Path) -> None:

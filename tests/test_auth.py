@@ -12,13 +12,21 @@ import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt import PyJWK
-from jwt.algorithms import RSAAlgorithm
+from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 from starlette.testclient import TestClient
 
 from relcoord.app import create_app
-from relcoord.auth import AuthError, RoleConfig, TokenValidator, extract_bearer_token
+from relcoord.auth import (
+    SIGNING_KEY_CACHE_TTL_SECONDS,
+    AuthError,
+    RoleConfig,
+    TokenValidator,
+    _SigningKeyCache,
+    extract_bearer_token,
+)
 from relcoord.in_memory_store import InMemoryImageInfoStore
 
 
@@ -50,11 +58,13 @@ def signing_key(
 def _make_token(
     private_pem: str,
     *,
+    algorithm: str = "RS256",
     issuer: str = "https://issuer.example.com",
     audience: str = "relcoord",
     subject: str = "system:serviceaccount:default:default",
     extra: dict[str, object] | None = None,
     expires_in: int = 300,
+    key_id: str | None = None,
 ) -> str:
     now = int(time.time())
     payload: dict[str, object] = {
@@ -66,7 +76,8 @@ def _make_token(
     }
     if extra:
         payload.update(extra)
-    return jwt.encode(payload, private_pem, algorithm="RS256")
+    headers = {"kid": key_id} if key_id is not None else None
+    return jwt.encode(payload, private_pem, algorithm=algorithm, headers=headers)
 
 
 def _role(
@@ -119,6 +130,31 @@ def test_validator_accepts_token(private_pem: str, signing_key: PyJWK) -> None:
     assert claims.subject == "system:serviceaccount:default:default"
 
 
+def test_validator_ignores_configured_algorithms() -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    signing_key = PyJWK(json.loads(ECAlgorithm.to_jwk(private_key.public_key())))
+    role = RoleConfig.from_mapping(
+        {
+            "name": "default",
+            "audience": "relcoord",
+            "issuer": "https://issuer.example.com",
+            "jwks-uri": "https://issuer.example.com/.well-known/jwks.json",
+            "algorithms": ["RS256"],
+            "claims": {"sub": "system:serviceaccount:default:default"},
+        }
+    )
+    validator = _make_validator([role], signing_key)
+
+    claims = validator.validate(_make_token(private_pem, algorithm="ES256"))
+
+    assert claims.role == "default"
+
+
 def test_validator_discovers_jwks_uri_from_issuer(signing_key: PyJWK) -> None:
     role = RoleConfig(
         name="default",
@@ -148,8 +184,108 @@ def test_validator_discovers_jwks_uri_from_issuer(signing_key: PyJWK) -> None:
         timeout=10.0,
     )
     mock_jwks_client.assert_called_once_with(
-        "https://issuer.example.com/keys", cache_keys=True
+        "https://issuer.example.com/keys", cache_keys=False
     )
+
+
+def test_validator_builds_one_jwks_client_per_issuer(signing_key: PyJWK) -> None:
+    with patch("relcoord.auth.PyJWKClient") as mock_jwks_client:
+        mock_client = MagicMock()
+        mock_client.get_signing_key_from_jwt.return_value = signing_key
+        mock_jwks_client.return_value = mock_client
+
+        TokenValidator(
+            [
+                _role(name="a", claims={"sub": "no-match"}),
+                _role(
+                    name="b",
+                    claims={"sub": "system:serviceaccount:default:default"},
+                ),
+            ]
+        )
+
+    mock_jwks_client.assert_called_once_with(
+        "https://issuer.example.com/.well-known/jwks.json", cache_keys=False
+    )
+
+
+def test_validator_uses_only_client_for_token_issuer(
+    private_pem: str, signing_key: PyJWK
+) -> None:
+    issuer_a_client = MagicMock()
+    issuer_b_client = MagicMock()
+    issuer_b_client.get_signing_key_from_jwt.return_value = signing_key
+    token = _make_token(private_pem, issuer="https://issuer-b.example.com")
+
+    with patch("relcoord.auth.PyJWKClient") as mock_jwks_client:
+        mock_jwks_client.side_effect = [issuer_a_client, issuer_b_client]
+        validator = TokenValidator(
+            [
+                RoleConfig(
+                    name="a",
+                    audience="relcoord",
+                    issuer="https://issuer-a.example.com",
+                    jwks_uri="https://issuer-a.example.com/keys",
+                    claims={"sub": "system:serviceaccount:default:default"},
+                ),
+                RoleConfig(
+                    name="b",
+                    audience="relcoord",
+                    issuer="https://issuer-b.example.com",
+                    jwks_uri="https://issuer-b.example.com/keys",
+                    claims={"sub": "system:serviceaccount:default:default"},
+                ),
+            ]
+        )
+
+    claims = validator.validate(token)
+
+    assert claims.role == "b"
+    issuer_a_client.get_signing_key_from_jwt.assert_not_called()
+    issuer_b_client.get_signing_key_from_jwt.assert_called_once_with(token)
+
+
+def test_validator_reuses_cached_signing_key_for_token_key_id(
+    private_pem: str, signing_key: PyJWK
+) -> None:
+    token = _make_token(private_pem, key_id="key-1")
+    validator = _make_validator([_role()], signing_key)
+    client = validator._clients["https://issuer.example.com"]
+
+    validator.validate(token)
+    validator.validate(token)
+
+    client.get_signing_key_from_jwt.assert_called_once_with(token)
+
+
+def test_signing_key_cache_expires_after_ttl(signing_key: PyJWK) -> None:
+    cache = _SigningKeyCache(max_size=2, ttl_seconds=SIGNING_KEY_CACHE_TTL_SECONDS)
+
+    with patch("relcoord.auth.time.monotonic", return_value=10.0):
+        cache.set(("issuer", "key-1", "RS256"), signing_key)
+
+    with patch("relcoord.auth.time.monotonic", return_value=3609.0):
+        assert cache.get(("issuer", "key-1", "RS256")) is signing_key
+
+    with patch("relcoord.auth.time.monotonic", return_value=3611.0):
+        assert cache.get(("issuer", "key-1", "RS256")) is None
+
+
+def test_signing_key_cache_evicts_least_recently_used(signing_key: PyJWK) -> None:
+    cache = _SigningKeyCache(max_size=2)
+    first = ("issuer", "key-1", "RS256")
+    second = ("issuer", "key-2", "RS256")
+    third = ("issuer", "key-3", "RS256")
+
+    cache.set(first, signing_key)
+    cache.set(second, signing_key)
+    assert cache.get(first) is signing_key
+
+    cache.set(third, signing_key)
+
+    assert cache.get(first) is signing_key
+    assert cache.get(second) is None
+    assert cache.get(third) is signing_key
 
 
 def test_validator_uses_kubernetes_service_account_for_issuer_discovery(
