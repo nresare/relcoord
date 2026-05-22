@@ -234,11 +234,13 @@ def test_change_passes_image_reference_to_processor() -> None:
 
 def test_change_without_image_and_tag_acknowledges_without_registering(
     client: TestClient,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    response = client.post(
-        "/v1/change",
-        json={"repo": "acme/config", "commit": "deadbeef"},
-    )
+    with caplog.at_level(logging.INFO, logger="relcoord.app"):
+        response = client.post(
+            "/v1/change",
+            json={"repo": "acme/config", "commit": "deadbeef"},
+        )
 
     assert response.status_code == 202
     assert response.json() == {
@@ -247,9 +249,20 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
         "registered": None,
         "processed": {"generated": 0},
     }
+    assert (
+        "change processing disabled: no manifests_repository configured; skipping "
+        "source checkout, manifest-builder invocation, manifests commit, and push "
+        "for repo acme/config at commit deadbeef"
+    ) in caplog.text
+    assert (
+        "Processed change for repo acme/config at commit deadbeef: generated 0 "
+        "manifest file(s)"
+    ) in caplog.text
 
 
-def test_change_processes_deploy_config_when_processor_is_configured() -> None:
+def test_change_processes_deploy_config_when_processor_is_configured(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class Processor:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, str | None]] = []
@@ -267,10 +280,11 @@ def test_change_processes_deploy_config_when_processor_is_configured() -> None:
         )
     )
 
-    response = client.post(
-        "/v1/change",
-        json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
-    )
+    with caplog.at_level(logging.INFO, logger="relcoord.app"):
+        response = client.post(
+            "/v1/change",
+            json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
+        )
 
     assert response.status_code == 202
     assert processor.calls == [("https://github.com/acme/config.git", "deadbeef", None)]
@@ -280,6 +294,45 @@ def test_change_processes_deploy_config_when_processor_is_configured() -> None:
         "registered": None,
         "processed": {"generated": 3},
     }
+    assert (
+        "Processing change for repo https://github.com/acme/config.git at commit "
+        "deadbeef with image None"
+    ) in caplog.text
+    assert (
+        "Processed change for repo https://github.com/acme/config.git at commit "
+        "deadbeef: generated 3 manifest file(s)"
+    ) in caplog.text
+
+
+def test_change_processor_logs_from_worker_thread(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Processor:
+        def process(self, repo: str, commit: str, image: str | None) -> object:
+            logging.getLogger("relcoord.change").info(
+                "processor logged for %s at %s with image %s", repo, commit, image
+            )
+            return type("Result", (), {"generated_count": 1})()
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
+    )
+
+    with caplog.at_level(logging.INFO):
+        response = client.post(
+            "/v1/change",
+            json={"repo": "https://github.com/acme/config.git", "commit": "deadbeef"},
+        )
+
+    assert response.status_code == 202
+    assert (
+        "processor logged for https://github.com/acme/config.git at deadbeef "
+        "with image None"
+    ) in caplog.text
 
 
 def test_change_converts_github_ssh_style_repo_uri() -> None:

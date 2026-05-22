@@ -53,6 +53,13 @@ class NoopChangeResult:
 
 class NoopChangeProcessor:
     def process(self, repo: str, commit: str, image: str | None) -> object:
+        logger.warning(
+            "change processing disabled: no manifests_repository configured; "
+            "skipping source checkout, manifest-builder invocation, manifests commit, "
+            "and push for repo %s at commit %s",
+            repo,
+            commit,
+        )
         return NoopChangeResult()
 
 
@@ -145,10 +152,22 @@ def create_app(
                     "timestamp": _format_timestamp(result.timestamp),
                     "created": result.created,
                 }
+            logger.info(
+                "Processing change for repo %s at commit %s with image %s",
+                repo,
+                commit,
+                manifest_image,
+            )
             result = await asyncio.to_thread(
                 change_processor.process, repo, commit, manifest_image
             )
             processed = _change_result_payload(result)
+            logger.info(
+                "Processed change for repo %s at commit %s: generated %s manifest file(s)",
+                repo,
+                commit,
+                processed["generated"],
+            )
         except ValidationError as exc:
             return _bad_request(request, error=exc.error, message=exc.message)
         except TimestampConflictError as exc:

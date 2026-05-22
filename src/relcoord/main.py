@@ -73,6 +73,9 @@ def make_change_processor(
     settings: Settings,
 ) -> ManifestChangeProcessor | NoopChangeProcessor:
     if settings.manifests_repository is None:
+        logger.warning(
+            "change processing disabled because manifests_repository is not configured"
+        )
         return NoopChangeProcessor()
     return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
