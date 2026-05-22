@@ -9,9 +9,15 @@ import click
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
 
-from relcoord.app import create_app
+from relcoord.app import (
+    BearerTokenValidator,
+    NoopChangeProcessor,
+    NoopTokenValidator,
+    RequestTokenValidator,
+    create_app,
+)
 from relcoord.auth import TokenValidator
-from relcoord.change import ChangeProcessor
+from relcoord.change import ChangeProcessor as ManifestChangeProcessor
 from relcoord.config import Settings
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.store import ImageInfoStore
@@ -32,7 +38,11 @@ async def run(config_path: str, disable_auth: bool) -> None:
     try:
         # This has been raised upstream: https://github.com/pgjones/hypercorn/issues/353
         # noinspection PyTypeChecker
-        app = create_app(store, token_validator, make_change_processor(settings))
+        app = create_app(
+            store,
+            token_validator=token_validator,
+            change_processor=make_change_processor(settings),
+        )
         await serve(app, config)  # ty: ignore[invalid-argument-type]
     finally:
         close = getattr(store, "close", None)
@@ -42,15 +52,15 @@ async def run(config_path: str, disable_auth: bool) -> None:
 
 def _build_token_validator(
     settings: Settings, disable_auth: bool
-) -> TokenValidator | None:
+) -> RequestTokenValidator:
     if disable_auth:
         logger.warning("authentication disabled by --disable-auth")
-        return None
+        return NoopTokenValidator()
     if not settings.roles:
         raise RuntimeError(
             "at least one [[role]] entry is required (or pass --disable-auth)"
         )
-    return TokenValidator(settings.roles)
+    return BearerTokenValidator(TokenValidator(settings.roles))
 
 
 async def make_store(settings: Settings) -> ImageInfoStore:
@@ -59,10 +69,12 @@ async def make_store(settings: Settings) -> ImageInfoStore:
     return await SurrealImageInfoStore.connect(settings.persistence)
 
 
-def make_change_processor(settings: Settings) -> ChangeProcessor | None:
+def make_change_processor(
+    settings: Settings,
+) -> ManifestChangeProcessor | NoopChangeProcessor:
     if settings.manifests_repository is None:
-        return None
-    return ChangeProcessor(
+        return NoopChangeProcessor()
+    return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
         idcat=settings.idcat,
     )

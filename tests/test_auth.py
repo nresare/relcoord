@@ -18,7 +18,7 @@ from jwt import PyJWK
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 from starlette.testclient import TestClient
 
-from relcoord.app import create_app
+from relcoord.app import BearerTokenValidator, NoopChangeProcessor, create_app
 from relcoord.auth import (
     SIGNING_KEY_CACHE_TTL_SECONDS,
     AuthError,
@@ -394,7 +394,13 @@ def test_validator_tries_each_role(private_pem: str, signing_key: PyJWK) -> None
 
 def test_write_endpoint_requires_bearer_token(signing_key: PyJWK) -> None:
     validator = _make_validator([_role()], signing_key)
-    client = TestClient(create_app(InMemoryImageInfoStore(), validator))
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            change_processor=NoopChangeProcessor(),
+            token_validator=BearerTokenValidator(validator),
+        )
+    )
 
     response = client.post(
         "/v1/image-versions",
@@ -409,7 +415,13 @@ def test_write_endpoint_accepts_valid_bearer_token(
     private_pem: str, signing_key: PyJWK
 ) -> None:
     validator = _make_validator([_role()], signing_key)
-    client = TestClient(create_app(InMemoryImageInfoStore(), validator))
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            change_processor=NoopChangeProcessor(),
+            token_validator=BearerTokenValidator(validator),
+        )
+    )
     token = _make_token(private_pem)
 
     response = client.post(
@@ -423,7 +435,13 @@ def test_write_endpoint_accepts_valid_bearer_token(
 
 def test_change_endpoint_requires_bearer_token(signing_key: PyJWK) -> None:
     validator = _make_validator([_role()], signing_key)
-    client = TestClient(create_app(InMemoryImageInfoStore(), validator))
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            change_processor=NoopChangeProcessor(),
+            token_validator=BearerTokenValidator(validator),
+        )
+    )
 
     response = client.post(
         "/v1/change",
@@ -435,7 +453,13 @@ def test_change_endpoint_requires_bearer_token(signing_key: PyJWK) -> None:
 
 def test_read_endpoints_do_not_require_token(signing_key: PyJWK) -> None:
     validator = _make_validator([_role()], signing_key)
-    client = TestClient(create_app(InMemoryImageInfoStore(), validator))
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            change_processor=NoopChangeProcessor(),
+            token_validator=BearerTokenValidator(validator),
+        )
+    )
 
     health = client.get("/healthz")
     latest = client.post(

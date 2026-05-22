@@ -29,20 +29,44 @@ class ChangeProcessor(Protocol):
     def process(self, repo: str, commit: str) -> object: ...
 
 
+class RequestTokenValidator(Protocol):
+    def validate(self, authorization_header: str | None) -> object: ...
+
+
+class BearerTokenValidator:
+    def __init__(self, token_validator: TokenValidator) -> None:
+        self._token_validator = token_validator
+
+    def validate(self, authorization_header: str | None) -> object:
+        token = extract_bearer_token(authorization_header)
+        return self._token_validator.validate(token)
+
+
+class NoopTokenValidator:
+    def validate(self, authorization_header: str | None) -> object:
+        return None
+
+
+class NoopChangeResult:
+    generated_count = 0
+
+
+class NoopChangeProcessor:
+    def process(self, repo: str, commit: str) -> object:
+        return NoopChangeResult()
+
+
 def create_app(
     store: ImageInfoStore,
-    token_validator: TokenValidator | None = None,
-    change_processor: ChangeProcessor | None = None,
+    token_validator: RequestTokenValidator,
+    change_processor: ChangeProcessor,
 ) -> Starlette:
     service = ImageVersionService(store=store)
 
     def _require_auth(request: Request) -> Response | None:
-        if token_validator is None:
-            return None
         try:
             header = request.headers.get("authorization")
-            token = extract_bearer_token(header)
-            token_validator.validate(token)
+            token_validator.validate(header)
         except AuthError as exc:
             logger.warning(
                 "Unauthorized request %s %s: %s",
@@ -119,10 +143,8 @@ def create_app(
                     "timestamp": _format_timestamp(result.timestamp),
                     "created": result.created,
                 }
-            processed = None
-            if change_processor is not None:
-                result = await asyncio.to_thread(change_processor.process, repo, commit)
-                processed = _change_result_payload(result)
+            result = await asyncio.to_thread(change_processor.process, repo, commit)
+            processed = _change_result_payload(result)
         except ValidationError as exc:
             return _bad_request(request, error=exc.error, message=exc.message)
         except TimestampConflictError as exc:
@@ -153,8 +175,7 @@ def create_app(
             "commit": commit,
             "registered": registered,
         }
-        if change_processor is not None:
-            body["processed"] = processed
+        body["processed"] = processed
         return JSONResponse(body, status_code=202)
 
     async def latest_versions(request: Request) -> Response:

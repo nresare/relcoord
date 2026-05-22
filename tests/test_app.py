@@ -6,7 +6,7 @@ from datetime import datetime
 import pytest
 from starlette.testclient import TestClient
 
-from relcoord.app import create_app
+from relcoord.app import NoopChangeProcessor, NoopTokenValidator, create_app
 from relcoord.change import DeployConfigError
 from relcoord.in_memory_store import InMemoryImageInfoStore
 
@@ -14,7 +14,13 @@ from relcoord.in_memory_store import InMemoryImageInfoStore
 @pytest.fixture
 def client() -> TestClient:
     store = InMemoryImageInfoStore()
-    return TestClient(create_app(store))
+    return TestClient(
+        create_app(
+            store,
+            token_validator=NoopTokenValidator(),
+            change_processor=NoopChangeProcessor(),
+        )
+    )
 
 
 def test_healthz(client: TestClient) -> None:
@@ -205,6 +211,7 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
         "repo": "acme/config",
         "commit": "deadbeef",
         "registered": None,
+        "processed": {"generated": 0},
     }
 
 
@@ -219,7 +226,11 @@ def test_change_processes_deploy_config_when_processor_is_configured() -> None:
 
     processor = Processor()
     client = TestClient(
-        create_app(InMemoryImageInfoStore(), change_processor=processor)
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=processor,
+        )
     )
 
     response = client.post(
@@ -248,7 +259,11 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
 
     processor = Processor()
     client = TestClient(
-        create_app(InMemoryImageInfoStore(), change_processor=processor)
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=processor,
+        )
     )
 
     response = client.post(
@@ -264,7 +279,13 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
 def test_change_rejects_non_github_ssh_style_repo_uri(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    client = TestClient(create_app(InMemoryImageInfoStore()))
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=NoopChangeProcessor(),
+        )
+    )
     caplog.set_level(logging.WARNING, logger="relcoord.app")
 
     response = client.post(
@@ -303,7 +324,11 @@ def test_change_reports_missing_deploy_config(
             raise DeployConfigError("missing .deploy")
 
     client = TestClient(
-        create_app(InMemoryImageInfoStore(), change_processor=Processor())
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
     )
     caplog.set_level(logging.WARNING, logger="relcoord.app")
 
