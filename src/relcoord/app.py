@@ -74,10 +74,10 @@ def create_app(
                 image=image, version=version, timestamp=timestamp
             )
         except ValidationError as exc:
-            return _json_error(status_code=400, error=exc.error, message=exc.message)
+            return _bad_request(request, error=exc.error, message=exc.message)
         except TimestampConflictError as exc:
-            return _json_error(
-                status_code=400,
+            return _bad_request(
+                request,
                 error="timestamp_conflict",
                 message=str(exc),
             )
@@ -124,16 +124,16 @@ def create_app(
                 result = await asyncio.to_thread(change_processor.process, repo, commit)
                 processed = _change_result_payload(result)
         except ValidationError as exc:
-            return _json_error(status_code=400, error=exc.error, message=exc.message)
+            return _bad_request(request, error=exc.error, message=exc.message)
         except TimestampConflictError as exc:
-            return _json_error(
-                status_code=400,
+            return _bad_request(
+                request,
                 error="timestamp_conflict",
                 message=str(exc),
             )
         except DeployConfigError as exc:
-            return _json_error(
-                status_code=400,
+            return _bad_request(
+                request,
                 error="invalid_deploy_config",
                 message=str(exc),
             )
@@ -168,7 +168,7 @@ def create_app(
             )
             versions = await service.latest_versions(images=images)
         except ValidationError as exc:
-            return _json_error(status_code=400, error=exc.error, message=exc.message)
+            return _bad_request(request, error=exc.error, message=exc.message)
 
         return JSONResponse({"versions": versions})
 
@@ -255,6 +255,17 @@ def _json_error(status_code: int, error: str, message: str) -> JSONResponse:
         {"error": error, "message": message},
         status_code=status_code,
     )
+
+
+def _bad_request(request: Request, *, error: str, message: str) -> JSONResponse:
+    logger.warning(
+        "Bad request %s %s: %s: %s",
+        request.method,
+        request.url.path,
+        error,
+        message,
+    )
+    return _json_error(status_code=400, error=error, message=message)
 
 
 def _format_timestamp(timestamp: datetime) -> str:
