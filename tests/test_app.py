@@ -198,6 +198,40 @@ def test_change_registers_image_version_when_image_and_tag_present(
     assert latest.json() == {"versions": {"registry.example.com/team/api": "1.2.3"}}
 
 
+def test_change_passes_image_reference_to_processor() -> None:
+    class Processor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str | None]] = []
+
+        def process(self, repo: str, commit: str, image: str | None) -> object:
+            self.calls.append((repo, commit, image))
+            return type("Result", (), {"generated_count": 1})()
+
+    processor = Processor()
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=processor,
+        )
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "repo": "acme/api",
+            "commit": "abc123",
+            "image": "registry.example.com/team/api",
+            "tag": "1.2.3",
+        },
+    )
+
+    assert response.status_code == 202
+    assert processor.calls == [
+        ("acme/api", "abc123", "registry.example.com/team/api:1.2.3")
+    ]
+
+
 def test_change_without_image_and_tag_acknowledges_without_registering(
     client: TestClient,
 ) -> None:
@@ -218,10 +252,10 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
 def test_change_processes_deploy_config_when_processor_is_configured() -> None:
     class Processor:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
+            self.calls: list[tuple[str, str, str | None]] = []
 
-        def process(self, repo: str, commit: str) -> object:
-            self.calls.append((repo, commit))
+        def process(self, repo: str, commit: str, image: str | None) -> object:
+            self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 3})()
 
     processor = Processor()
@@ -239,7 +273,7 @@ def test_change_processes_deploy_config_when_processor_is_configured() -> None:
     )
 
     assert response.status_code == 202
-    assert processor.calls == [("https://github.com/acme/config.git", "deadbeef")]
+    assert processor.calls == [("https://github.com/acme/config.git", "deadbeef", None)]
     assert response.json() == {
         "repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
@@ -251,10 +285,10 @@ def test_change_processes_deploy_config_when_processor_is_configured() -> None:
 def test_change_converts_github_ssh_style_repo_uri() -> None:
     class Processor:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
+            self.calls: list[tuple[str, str, str | None]] = []
 
-        def process(self, repo: str, commit: str) -> object:
-            self.calls.append((repo, commit))
+        def process(self, repo: str, commit: str, image: str | None) -> object:
+            self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 0})()
 
     processor = Processor()
@@ -272,7 +306,7 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
     )
 
     assert response.status_code == 202
-    assert processor.calls == [("https://github.com/acme/config.git", "deadbeef")]
+    assert processor.calls == [("https://github.com/acme/config.git", "deadbeef", None)]
     assert response.json()["repo"] == "https://github.com/acme/config.git"
 
 
@@ -320,7 +354,7 @@ def test_change_reports_missing_deploy_config(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Processor:
-        def process(self, repo: str, commit: str) -> object:
+        def process(self, repo: str, commit: str, image: str | None) -> object:
             raise DeployConfigError("missing .deploy")
 
     client = TestClient(

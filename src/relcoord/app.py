@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class ChangeProcessor(Protocol):
-    def process(self, repo: str, commit: str) -> object: ...
+    def process(self, repo: str, commit: str, image: str | None) -> object: ...
 
 
 class RequestTokenValidator(Protocol):
@@ -52,7 +52,7 @@ class NoopChangeResult:
 
 
 class NoopChangeProcessor:
-    def process(self, repo: str, commit: str) -> object:
+    def process(self, repo: str, commit: str, image: str | None) -> object:
         return NoopChangeResult()
 
 
@@ -135,15 +135,19 @@ def create_app(
                 )
 
             registered: dict[str, Any] | None = None
+            manifest_image = None
             if image is not None and tag is not None:
                 result = await service.register_version(image=image, version=tag)
+                manifest_image = f"{image}:{tag}"
                 registered = {
                     "image": result.image,
                     "version": result.version,
                     "timestamp": _format_timestamp(result.timestamp),
                     "created": result.created,
                 }
-            result = await asyncio.to_thread(change_processor.process, repo, commit)
+            result = await asyncio.to_thread(
+                change_processor.process, repo, commit, manifest_image
+            )
             processed = _change_result_payload(result)
         except ValidationError as exc:
             return _bad_request(request, error=exc.error, message=exc.message)

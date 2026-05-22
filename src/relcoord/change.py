@@ -41,7 +41,7 @@ class ChangeProcessor:
     manifests_repository: str
     idcat: IdcatSettings | None = None
 
-    def process(self, repo: str, commit: str) -> ChangeResult:
+    def process(self, repo: str, commit: str, image: str | None) -> ChangeResult:
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-change-"))
         try:
             source_checkout = workdir / "source"
@@ -88,6 +88,7 @@ class ChangeProcessor:
                 manifests_checkout,
                 repo_root=Path("/"),
                 create_commit=True,
+                image=image,
             )
             generated_paths = ", ".join(
                 str(path.relative_to(manifests_checkout)) for path in sorted(generated)
