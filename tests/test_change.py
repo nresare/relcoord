@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
+import logging
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from relcoord import change
 from relcoord.change import ChangeProcessor, DeployConfigError
 
 
 def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     calls: list[tuple[object, ...]] = []
 
@@ -37,8 +41,10 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         )
         return {manifests_checkout / "api.yaml", manifests_checkout / "worker.yaml"}
 
-    def fake_run_git(args: list[str], **kwargs) -> None:
+    def fake_run_git(args: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
         calls.append(("git", args, kwargs["cwd"].name, kwargs.get("env")))
+        stdout = "feedface\n" if args == ["rev-parse", "HEAD"] else ""
+        return subprocess.CompletedProcess(["git", *args], 0, stdout=stdout)
 
     monkeypatch.setattr(
         change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
@@ -48,10 +54,11 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
     monkeypatch.setattr(change, "generate", fake_generate)
     monkeypatch.setattr(change, "_run_git", fake_run_git)
 
-    result = ChangeProcessor("https://github.com/acme/manifests.git").process(
-        "https://github.com/acme/config.git",
-        "deadbeef",
-    )
+    with caplog.at_level(logging.INFO, logger="relcoord.change"):
+        result = ChangeProcessor("https://github.com/acme/manifests.git").process(
+            "https://github.com/acme/config.git",
+            "deadbeef",
+        )
 
     assert result.repo == "https://github.com/acme/config.git"
     assert result.commit == "deadbeef"
@@ -74,8 +81,22 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
             {"depth": "1"},
         ),
         ("generate", ".deploy", "manifests", Path("/"), True),
+        ("git", ["rev-parse", "HEAD"], "manifests", None),
         ("git", ["push"], "manifests", None),
     ]
+    assert (
+        "change step 2/7: checking out source repo https://github.com/acme/config.git "
+        "at commit deadbeef"
+    ) in caplog.text
+    assert "change step 5/7: invoking manifest-builder" in caplog.text
+    assert (
+        "change step 6/7: manifest-builder created manifests commit feedface"
+        in caplog.text
+    )
+    assert (
+        "change step 7/7: pushing manifests commit feedface to "
+        "https://github.com/acme/manifests.git"
+    ) in caplog.text
 
 
 def test_change_processor_requires_top_level_deploy_directory(
