@@ -11,7 +11,6 @@ from hypercorn.config import Config as HypercornConfig
 
 from relcoord.app import (
     BearerTokenValidator,
-    NoopChangeProcessor,
     NoopTokenValidator,
     RequestTokenValidator,
     create_app,
@@ -34,6 +33,7 @@ async def run(config_path: str, disable_auth: bool) -> None:
     config = HypercornConfig()
     config.bind = [f"{settings.host}:{settings.port}"]
     token_validator = _build_token_validator(settings, disable_auth)
+    change_processor = make_change_processor(settings)
     store = await make_store(settings)
     try:
         # This has been raised upstream: https://github.com/pgjones/hypercorn/issues/353
@@ -41,7 +41,7 @@ async def run(config_path: str, disable_auth: bool) -> None:
         app = create_app(
             store,
             token_validator=token_validator,
-            change_processor=make_change_processor(settings),
+            change_processor=change_processor,
         )
         await serve(app, config)  # ty: ignore[invalid-argument-type]
     finally:
@@ -71,12 +71,9 @@ async def make_store(settings: Settings) -> ImageInfoStore:
 
 def make_change_processor(
     settings: Settings,
-) -> ManifestChangeProcessor | NoopChangeProcessor:
+) -> ManifestChangeProcessor:
     if settings.manifests_repository is None:
-        logger.warning(
-            "change processing disabled because manifests_repository is not configured"
-        )
-        return NoopChangeProcessor()
+        raise RuntimeError("manifests-repository must be configured at the top level")
     return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
         idcat=settings.idcat,
