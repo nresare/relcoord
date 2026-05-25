@@ -30,6 +30,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         repo_root: Path,
         create_commit: bool,
         image: str | None,
+        namespace: str,
     ) -> set[Path]:
         calls.append(
             (
@@ -39,6 +40,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
                 repo_root,
                 create_commit,
                 image,
+                namespace,
             )
         )
         return {manifests_checkout / "api.yaml", manifests_checkout / "worker.yaml"}
@@ -93,6 +95,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
             Path("/"),
             True,
             "registry.example.com/team/api:1.2.3",
+            "config",
         ),
         ("head", "manifests"),
         ("push", "manifests", "https://github.com/acme/manifests.git", None),
@@ -131,6 +134,18 @@ def test_change_processor_requires_top_level_deploy_directory(
         assert "does not contain a top-level .deploy directory" in str(exc)
     else:
         raise AssertionError("expected DeployConfigError")
+
+
+@pytest.mark.parametrize(
+    ("repo", "namespace"),
+    [
+        ("https://github.com/acme/config.git", "config"),
+        ("https://github.com/acme/config", "config"),
+        ("acme/config.git", "config"),
+    ],
+)
+def test_namespace_from_repo(repo: str, namespace: str) -> None:
+    assert change._namespace_from_repo(repo) == namespace
 
 
 def test_checkout_commit_materializes_requested_commit(tmp_path: Path) -> None:

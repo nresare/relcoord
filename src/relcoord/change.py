@@ -89,6 +89,7 @@ class ChangeProcessor:
                 repo_root=Path("/"),
                 create_commit=True,
                 image=image,
+                namespace=_namespace_from_repo(repo),
             )
             generated_paths = ", ".join(
                 str(path.relative_to(manifests_checkout)) for path in sorted(generated)
@@ -139,6 +140,11 @@ def _checkout_commit(
 ) -> None:
     _clone_repository(source, target, idcat, no_checkout=True)
     _dulwich_checkout(target, commit)
+
+
+def _namespace_from_repo(repo: str) -> str:
+    namespace = repo.rsplit("/", maxsplit=1)[-1]
+    return namespace.removesuffix(".git")
 
 
 def _clone_repository(
