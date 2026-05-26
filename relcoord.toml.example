@@ -5,6 +5,7 @@ port = 8080
 manifests-repository = "https://github.com/example/manifests.git"
 
 [persistence]
+backend = "surrealdb"
 uri = "ws://localhost:8000"
 namespace = "default"
 database = "relcoord"

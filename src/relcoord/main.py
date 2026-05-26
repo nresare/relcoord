@@ -64,7 +64,7 @@ def _build_token_validator(
 
 
 async def make_store(settings: Settings) -> ImageInfoStore:
-    if settings.persistence is None:
+    if settings.persistence is None or settings.persistence.backend == "in-memory":
         return InMemoryImageInfoStore()
     return await SurrealImageInfoStore.connect(settings.persistence)
 

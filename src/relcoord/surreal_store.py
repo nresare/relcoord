@@ -90,6 +90,8 @@ class SurrealImageInfoStore(ImageInfoStore):
 
     @classmethod
     async def connect(cls, config: PersistenceSettings) -> "SurrealImageInfoStore":
+        if config.uri is None or config.idmouse is None:
+            raise ValueError("SurrealDB persistence requires uri and idmouse settings")
         db = AsyncSurreal(config.uri)
         await db.connect(config.uri)
 

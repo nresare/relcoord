@@ -5,7 +5,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from relcoord.auth import RoleConfig
 
@@ -36,13 +36,34 @@ class IdmouseSettings:
 
 @dataclass(frozen=True)
 class PersistenceSettings:
-    uri: str
-    idmouse: IdmouseSettings
+    backend: Literal["in-memory", "surrealdb"] = "surrealdb"
+    uri: str | None = None
+    idmouse: IdmouseSettings | None = None
     namespace: str = "default"
     database: str = "relcoord"
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "PersistenceSettings":
+        backend_value = _string_or_default(data, "backend", cls.backend)
+        if backend_value not in ("in-memory", "surrealdb"):
+            raise ValueError(
+                "persistence.backend must be either 'in-memory' or 'surrealdb'"
+            )
+        backend = cast(Literal["in-memory", "surrealdb"], backend_value)
+
+        if backend == "in-memory":
+            return cls(
+                backend=backend,
+                uri=_optional_persistence_string(data, "uri"),
+                namespace=_string_or_default(data, "namespace", cls.namespace),
+                database=_string_or_default(data, "database", cls.database),
+                idmouse=(
+                    IdmouseSettings.from_mapping(data["idmouse"])
+                    if "idmouse" in data
+                    else None
+                ),
+            )
+
         if not isinstance(data.get("uri"), str) or not data["uri"].strip():
             raise ValueError("persistence.uri must be a non-empty string")
 
@@ -53,6 +74,7 @@ class PersistenceSettings:
             raise ValueError("persistence.idmouse must be a table")
 
         return cls(
+            backend=backend,
             uri=data["uri"],
             namespace=_string_or_default(data, "namespace", cls.namespace),
             database=_string_or_default(data, "database", cls.database),
@@ -152,4 +174,13 @@ def _optional_string(data: dict[str, Any], key: str) -> str | None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
+    return value
+
+
+def _optional_persistence_string(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"persistence.{key} must be a non-empty string")
     return value

@@ -17,6 +17,7 @@ def test_settings_parse_surrealdb_idmouse_config(tmp_path: Path) -> None:
         port = 9000
 
         [persistence]
+        backend = "surrealdb"
         uri = "ws://surrealdb:8000/"
         namespace = "default"
         database = "relcoord"
@@ -32,12 +33,48 @@ def test_settings_parse_surrealdb_idmouse_config(tmp_path: Path) -> None:
     assert settings.host == "127.0.0.1"
     assert settings.port == 9000
     assert settings.persistence is not None
+    assert settings.persistence.backend == "surrealdb"
     assert settings.persistence.uri == "ws://surrealdb:8000/"
     assert settings.persistence.namespace == "default"
     assert settings.persistence.database == "relcoord"
     assert settings.persistence.idmouse is not None
     assert settings.persistence.idmouse.url == "http://idmouse:9000/token"
     assert settings.persistence.idmouse.bearer_token() == "local-bearer-token"
+
+
+def test_settings_parse_in_memory_persistence_without_surrealdb_config(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [persistence]
+        backend = "in-memory"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.persistence is not None
+    assert settings.persistence.backend == "in-memory"
+    assert settings.persistence.uri is None
+    assert settings.persistence.idmouse is None
+
+
+def test_settings_rejects_unknown_persistence_backend(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [persistence]
+        backend = "postgres"
+        """
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="persistence.backend must be either 'in-memory' or 'surrealdb'",
+    ):
+        Settings.from_toml(config)
 
 
 def test_settings_parses_manifests_repository(tmp_path: Path) -> None:
