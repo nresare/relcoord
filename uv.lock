@@ -589,7 +589,7 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.4.1.dev33+ga925aca5e"
+version = "0.4.1.dev34+gf0ede6896"
 source = { registry = "https://repo.noa.re/" }
 dependencies = [
     { name = "click" },
@@ -598,7 +598,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.4.1.dev33%2Bga925aca5e-py3-none-any.whl", hash = "sha256:86dcf3a7b402a8d47aaa82084e89e83c14169033dac158d7f36f0aaa040848c7", size = 44177 },
+    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.4.1.dev34%2Bgf0ede6896-py3-none-any.whl", hash = "sha256:6d3b23e9d5f0b47c4c637e0f5cace0e2b19d176a0fed1277c5abdb5ad9c9f600", size = 44506 },
 ]
 
 [[package]]
