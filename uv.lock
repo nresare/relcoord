@@ -133,7 +133,7 @@ wheels = [
 
 [[package]]
 name = "bktools"
-version = "0.1.1.dev38+g96c574b72"
+version = "0.1.1.dev39+g4bbb06b5e"
 source = { registry = "https://repo.noa.re/" }
 dependencies = [
     { name = "click" },
@@ -141,7 +141,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://repo.noa.re/bktools/bktools-0.1.1.dev38%2Bg96c574b72-py3-none-any.whl", hash = "sha256:28c75a2a128e73eb7f70f2203bf947f03b1ddd1a4629e646c1ec326c3e68e245", size = 15718 },
+    { url = "https://repo.noa.re/bktools/bktools-0.1.1.dev39%2Bg4bbb06b5e-py3-none-any.whl", hash = "sha256:bed2671bbee47b732d213521126455e23d316587098fd27c1335766089e76df6", size = 15780 },
 ]
 
 [[package]]
@@ -589,7 +589,7 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.4.1.dev32+g8f3bcc4a2"
+version = "0.4.1.dev33+ga925aca5e"
 source = { registry = "https://repo.noa.re/" }
 dependencies = [
     { name = "click" },
@@ -598,7 +598,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.4.1.dev32%2Bg8f3bcc4a2-py3-none-any.whl", hash = "sha256:d8d337da7eb264dc9d797ca06d4dc2e1105f3f666e1aa820d5d0d86f09cef099", size = 43780 },
+    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.4.1.dev33%2Bga925aca5e-py3-none-any.whl", hash = "sha256:86dcf3a7b402a8d47aaa82084e89e83c14169033dac158d7f36f0aaa040848c7", size = 44177 },
 ]
 
 [[package]]
