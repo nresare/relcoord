@@ -100,17 +100,27 @@ class ChangeProcessor:
                 self.idcat,
                 depth="1",
             )
+            repo_root = Path("/")
+            create_commit = True
+            namespace = _namespace_from_repo(repo)
             logger.info(
-                "change step 5/7: invoking manifest-builder with deploy config %s",
+                "change step 5/7: invoking manifest-builder generate("
+                "deploy_config=%s, manifests_checkout=%s, repo_root=%s, "
+                "create_commit=%s, image=%s, namespace=%s)",
                 deploy_config,
+                manifests_checkout,
+                repo_root,
+                create_commit,
+                image,
+                namespace,
             )
             generation_result = generate(
                 deploy_config,
                 manifests_checkout,
-                repo_root=Path("/"),
-                create_commit=True,
+                repo_root=repo_root,
+                create_commit=create_commit,
                 image=image,
-                namespace=_namespace_from_repo(repo),
+                namespace=namespace,
             )
             generated = _written_paths(generation_result)
             generated_paths = ", ".join(
