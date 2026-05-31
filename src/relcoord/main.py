@@ -29,8 +29,7 @@ LOG_FORMAT = "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s: %(message)s"
 logger = logging.getLogger(__name__)
 
 
-async def run(config_path: str, disable_auth: bool) -> None:
-    settings = Settings.from_toml(config_path)
+async def run(settings: Settings, disable_auth: bool) -> None:
     config = HypercornConfig()
     config.bind = [f"{settings.host}:{settings.port}"]
     token_validator = _build_token_validator(settings, disable_auth)
@@ -101,16 +100,18 @@ def make_change_processor(
     help="Disable bearer-token authentication on write endpoints.",
 )
 def main(config_path: str, disable_auth: bool) -> None:
-    configure_logging()
-    asyncio.run(run(config_path, disable_auth))
+    settings = Settings.from_toml(config_path)
+    configure_logging(settings.log_level)
+    asyncio.run(run(settings, disable_auth))
 
 
-def configure_logging() -> None:
+def configure_logging(log_level: str) -> None:
+    level = logging.getLevelNamesMapping()[log_level]
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(level)
     if not root_logger.handlers:
         logging.basicConfig(
-            level=logging.DEBUG,
+            level=level,
             format=LOG_FORMAT,
             datefmt="%Y-%m-%d %H:%M:%S %z",
         )

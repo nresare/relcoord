@@ -131,6 +131,7 @@ class IdcatSettings:
 class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
+    log_level: str = "INFO"
     manifests_repository: str | None = None
     detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
@@ -171,6 +172,7 @@ class Settings:
         return cls(
             host=data.get("host", cls.host),
             port=data.get("port", cls.port),
+            log_level=_log_level_or_default(data, "log-level", cls.log_level),
             manifests_repository=_optional_string(data, "manifests-repository"),
             detect_deployment=_bool_or_default(
                 data,
@@ -206,6 +208,18 @@ def _bool_or_default(data: dict[str, Any], key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{key} must be a boolean")
     return value
+
+
+def _log_level_or_default(data: dict[str, Any], key: str, default: str) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    normalized = value.upper()
+    if normalized not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        raise ValueError(
+            f"{key} must be one of DEBUG, INFO, WARNING, ERROR, or CRITICAL"
+        )
+    return normalized
 
 
 def _optional_persistence_string(data: dict[str, Any], key: str) -> str | None:

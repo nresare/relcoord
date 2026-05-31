@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import asyncio
+import logging
 
 import pytest
 
@@ -8,7 +9,7 @@ from relcoord.change import ChangeProcessor
 from relcoord.config import PersistenceSettings, Settings
 from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.in_memory_store import InMemoryImageInfoStore
-from relcoord.main import make_change_processor, make_store
+from relcoord.main import configure_logging, make_change_processor, make_store
 
 
 def test_make_change_processor_requires_manifests_repository() -> None:
@@ -61,3 +62,15 @@ def test_make_store_uses_dynamodb_backend(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert store is expected
+
+
+def test_configure_logging_uses_configured_log_level() -> None:
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+
+    try:
+        configure_logging("WARNING")
+
+        assert root_logger.level == logging.WARNING
+    finally:
+        root_logger.setLevel(original_level)

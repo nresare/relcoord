@@ -146,6 +146,35 @@ def test_settings_defaults_detect_deployment_to_false(tmp_path: Path) -> None:
     assert settings.detect_deployment is False
 
 
+def test_settings_defaults_log_level_to_info(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text("")
+
+    settings = Settings.from_toml(config)
+
+    assert settings.log_level == "INFO"
+
+
+def test_settings_parses_log_level(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('log-level = "debug"\n')
+
+    settings = Settings.from_toml(config)
+
+    assert settings.log_level == "DEBUG"
+
+
+def test_settings_rejects_unknown_log_level(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('log-level = "verbose"\n')
+
+    with pytest.raises(
+        ValueError,
+        match="log-level must be one of DEBUG, INFO, WARNING, ERROR, or CRITICAL",
+    ):
+        Settings.from_toml(config)
+
+
 def test_settings_rejects_non_boolean_detect_deployment(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text('detect-deployment = "yes"\n')
