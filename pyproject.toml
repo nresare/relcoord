@@ -29,6 +29,7 @@ dev = [
   "ty",
   "ruff",
   "bktools",
+  "httpx2>=2.4.0",
 ]
 
 
