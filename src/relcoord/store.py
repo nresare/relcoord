@@ -10,6 +10,12 @@ from relcoord.models import RegisterResult
 
 
 class ImageInfoStore(ABC):
+    transient_exceptions: tuple[type[BaseException], ...] = ()
+
+    @abstractmethod
+    async def health_check(self) -> None:
+        raise NotImplementedError
+
     @abstractmethod
     async def register(
         self, image: str, version: str, timestamp: datetime

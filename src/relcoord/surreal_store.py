@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import surrealdb
+from websockets.exceptions import ConnectionClosed, WebSocketException
 from surrealdb import AsyncSurreal
 
 from relcoord.config import IdmouseSettings, PersistenceSettings
@@ -79,6 +80,8 @@ class IdmouseClient:
 
 
 class SurrealImageInfoStore(ImageInfoStore):
+    transient_exceptions = (ConnectionClosed, WebSocketException)
+
     def __init__(
         self,
         db: Any,
@@ -124,6 +127,9 @@ class SurrealImageInfoStore(ImageInfoStore):
                 ON image_version FIELDS image, timestamp UNIQUE;
             """
         )
+
+    async def health_check(self) -> None:
+        await self._db.query("INFO FOR DB;")
 
     async def register(
         self, image: str, version: str, timestamp: datetime

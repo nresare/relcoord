@@ -8,7 +8,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    ConnectTimeoutError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+    ProxyConnectionError,
+    ReadTimeoutError,
+)
 
 from relcoord.config import PersistenceSettings
 from relcoord.errors import TimestampConflictError
@@ -22,6 +29,14 @@ TIMESTAMP_PREFIX = "TIMESTAMP#"
 
 
 class DynamoDBImageInfoStore(ImageInfoStore):
+    transient_exceptions = (
+        ConnectTimeoutError,
+        ConnectionClosedError,
+        EndpointConnectionError,
+        ProxyConnectionError,
+        ReadTimeoutError,
+    )
+
     def __init__(self, client: Any, table_name: str) -> None:
         self._client = client
         self._table_name = table_name
@@ -37,6 +52,12 @@ class DynamoDBImageInfoStore(ImageInfoStore):
         )
         logger.info("Using DynamoDB table %s for persistence", config.table_name)
         return cls(client, config.table_name)
+
+    async def health_check(self) -> None:
+        await asyncio.to_thread(
+            self._client.describe_table,
+            TableName=self._table_name,
+        )
 
     async def register(
         self, image: str, version: str, timestamp: datetime

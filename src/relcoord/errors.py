@@ -25,3 +25,11 @@ class TimestampConflictError(Exception):
         self.image = image
         self.existing_version = existing_version
         self.requested_version = requested_version
+
+
+class PersistenceUnavailableError(Exception):
+    """Raised when a persistence operation cannot reach its backend."""
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(f"persistence backend unavailable during {operation}")
+        self.operation = operation

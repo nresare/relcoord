@@ -14,6 +14,9 @@ class InMemoryImageInfoStore(ImageInfoStore):
         self._versions_by_image: dict[str, dict[str, StoredVersion]] = {}
         self._timestamp_index: dict[str, dict[datetime, str]] = {}
 
+    async def health_check(self) -> None:
+        return None
+
     async def register(
         self, image: str, version: str, timestamp: datetime
     ) -> RegisterResult:

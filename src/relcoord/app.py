@@ -17,7 +17,11 @@ from starlette.routing import Route
 
 from relcoord.auth import AuthError, TokenValidator, extract_bearer_token
 from relcoord.change import ChangeProcessingError, DeployConfigError
-from relcoord.errors import TimestampConflictError, ValidationError
+from relcoord.errors import (
+    PersistenceUnavailableError,
+    TimestampConflictError,
+    ValidationError,
+)
 from relcoord.git import github_https_url_from_ssh_style_uri, is_ssh_style_git_uri
 from relcoord.service import ImageVersionService
 from relcoord.store import ImageInfoStore
@@ -84,8 +88,26 @@ def create_app(
             return _json_error(status_code=401, error="unauthorized", message=str(exc))
         return None
 
-    async def health(_: Request) -> Response:
-        return JSONResponse({"status": "ok"})
+    async def health(request: Request) -> Response:
+        try:
+            await store.health_check()
+        except PersistenceUnavailableError as exc:
+            logger.warning(
+                "Health check failed for persistence operation %s",
+                exc.operation,
+                exc_info=True,
+            )
+            return JSONResponse(
+                {"status": "unhealthy", "checks": {"database": "unavailable"}},
+                status_code=503,
+            )
+        except Exception:
+            logger.exception("Health check failed for persistence backend")
+            return JSONResponse(
+                {"status": "unhealthy", "checks": {"database": "unavailable"}},
+                status_code=503,
+            )
+        return JSONResponse({"status": "ok", "checks": {"database": "ok"}})
 
     async def register_image_version(request: Request) -> Response:
         unauthorized = _require_auth(request)
@@ -112,6 +134,8 @@ def create_app(
                 error="timestamp_conflict",
                 message=str(exc),
             )
+        except PersistenceUnavailableError as exc:
+            return _persistence_unavailable(request, exc)
 
         status_code = 201 if result.created else 200
         return JSONResponse(
@@ -196,6 +220,8 @@ def create_app(
                 error="invalid_deploy_config",
                 message=str(exc),
             )
+        except PersistenceUnavailableError as exc:
+            return _persistence_unavailable(request, exc)
         except ChangeProcessingError as exc:
             logger.exception(
                 "Failed to process change for repo %s at commit %s", repo, commit
@@ -227,6 +253,8 @@ def create_app(
             versions = await service.latest_versions(images=images)
         except ValidationError as exc:
             return _bad_request(request, error=exc.error, message=exc.message)
+        except PersistenceUnavailableError as exc:
+            return _persistence_unavailable(request, exc)
 
         return JSONResponse({"versions": versions})
 
@@ -330,6 +358,23 @@ def _bad_request(request: Request, *, error: str, message: str) -> JSONResponse:
         message,
     )
     return _json_error(status_code=400, error=error, message=message)
+
+
+def _persistence_unavailable(
+    request: Request, exc: PersistenceUnavailableError
+) -> JSONResponse:
+    logger.error(
+        "Persistence operation %s failed while handling %s %s",
+        exc.operation,
+        request.method,
+        request.url.path,
+        exc_info=True,
+    )
+    return _json_error(
+        status_code=503,
+        error="persistence_unavailable",
+        message="persistence backend unavailable",
+    )
 
 
 def _format_timestamp(timestamp: datetime) -> str:

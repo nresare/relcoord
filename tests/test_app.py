@@ -8,7 +8,10 @@ from starlette.testclient import TestClient
 
 from relcoord.app import NoopChangeProcessor, NoopTokenValidator, create_app
 from relcoord.change import DeployConfigError
+from relcoord.errors import PersistenceUnavailableError
 from relcoord.in_memory_store import InMemoryImageInfoStore
+from relcoord.models import RegisterResult
+from relcoord.store import ImageInfoStore
 
 
 @pytest.fixture
@@ -27,7 +30,32 @@ def test_healthz(client: TestClient) -> None:
     response = client.get("/healthz")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "checks": {"database": "ok"}}
+
+
+def test_healthz_reports_unavailable_persistence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = TestClient(
+        create_app(
+            UnavailableStore("persistence health check"),
+            token_validator=NoopTokenValidator(),
+            change_processor=NoopChangeProcessor(),
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="relcoord.app"):
+        response = client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "checks": {"database": "unavailable"},
+    }
+    assert (
+        "Health check failed for persistence operation persistence health check"
+        in caplog.text
+    )
 
 
 def test_logs_requests(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
@@ -71,6 +99,55 @@ def test_register_and_resolve_latest_version(client: TestClient) -> None:
             "registry.example.com/team/api": "1.2.3",
             "registry.example.com/team/worker": None,
         }
+    }
+
+
+def test_register_reports_unavailable_persistence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = TestClient(
+        create_app(
+            UnavailableStore("register image version"),
+            token_validator=NoopTokenValidator(),
+            change_processor=NoopChangeProcessor(),
+        )
+    )
+
+    with caplog.at_level(logging.ERROR, logger="relcoord.app"):
+        response = client.post(
+            "/v1/image-versions",
+            json={"image": "registry.example.com/team/api", "version": "1.2.3"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "persistence_unavailable",
+        "message": "persistence backend unavailable",
+    }
+    assert (
+        "Persistence operation register image version failed while handling "
+        "POST /v1/image-versions"
+    ) in caplog.text
+
+
+def test_latest_reports_unavailable_persistence() -> None:
+    client = TestClient(
+        create_app(
+            UnavailableStore("fetch latest image versions"),
+            token_validator=NoopTokenValidator(),
+            change_processor=NoopChangeProcessor(),
+        )
+    )
+
+    response = client.post(
+        "/v1/images/latest",
+        json={"images": ["registry.example.com/team/api"]},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "persistence_unavailable",
+        "message": "persistence backend unavailable",
     }
 
 
@@ -448,6 +525,22 @@ def test_git_clone_endpoint_is_not_registered(client: TestClient) -> None:
     response = client.post("/v1/git/clone", json={"source": "https://example.com"})
 
     assert response.status_code == 404
+
+
+class UnavailableStore(ImageInfoStore):
+    def __init__(self, operation: str) -> None:
+        self._operation = operation
+
+    async def health_check(self) -> None:
+        raise PersistenceUnavailableError(self._operation)
+
+    async def register(
+        self, image: str, version: str, timestamp: datetime
+    ) -> RegisterResult:
+        raise PersistenceUnavailableError(self._operation)
+
+    async def latest_for_image(self, image: str) -> str | None:
+        raise PersistenceUnavailableError(self._operation)
 
 
 @pytest.mark.parametrize(

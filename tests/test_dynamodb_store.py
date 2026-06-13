@@ -69,9 +69,28 @@ def test_dynamodb_store_rejects_timestamp_conflict() -> None:
     asyncio.run(run())
 
 
+def test_dynamodb_store_health_check_describes_table() -> None:
+    async def run() -> FakeDynamoDBClient:
+        client = FakeDynamoDBClient()
+        store = DynamoDBImageInfoStore(client, "image-versions")
+
+        await store.health_check()
+
+        return client
+
+    client = asyncio.run(run())
+
+    assert client.described_tables == ["image-versions"]
+
+
 class FakeDynamoDBClient:
     def __init__(self) -> None:
         self._items: dict[tuple[str, str], dict[str, Any]] = {}
+        self.described_tables: list[str] = []
+
+    def describe_table(self, **kwargs: Any) -> dict[str, Any]:
+        self.described_tables.append(kwargs["TableName"])
+        return {"Table": {"TableName": kwargs["TableName"]}}
 
     def get_item(self, **kwargs: Any) -> dict[str, Any]:
         key = kwargs["Key"]

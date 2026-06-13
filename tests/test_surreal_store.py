@@ -82,6 +82,20 @@ def test_surreal_store_rejects_timestamp_conflict() -> None:
     asyncio.run(run())
 
 
+def test_surreal_store_health_check_queries_database() -> None:
+    async def run() -> FakeSurrealDb:
+        db = FakeSurrealDb()
+        store = SurrealImageInfoStore(db)
+
+        await store.health_check()
+
+        return db
+
+    db = asyncio.run(run())
+
+    assert db.queries == ["INFO FOR DB;"]
+
+
 def test_idmouse_client_fetches_token_with_local_bearer_token(tmp_path: Path) -> None:
     async def run() -> IdmouseTokenLease:
         token_file = tmp_path / "idmouse-bearer-token"
@@ -133,3 +147,14 @@ def _jwt(claims: dict[str, str]) -> str:
 def _b64(payload: dict[str, str]) -> str:
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     return encoded.rstrip("=")
+
+
+class FakeSurrealDb:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def query(
+        self, query: str, vars: dict[str, object] | None = None
+    ) -> list[object]:
+        self.queries.append(query)
+        return []
