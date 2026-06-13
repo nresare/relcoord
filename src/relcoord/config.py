@@ -297,7 +297,13 @@ def _required_output_string(data: dict[str, Any], key: str) -> str:
 
 
 def _required_output_directory(data: dict[str, Any]) -> Path:
-    directory = Path(_required_output_string(data, "directory"))
+    value = data.get("directory")
+    if value is None:
+        directory = Path(".")
+    elif not isinstance(value, str) or not value.strip():
+        raise ValueError("output.directory must be a non-empty string")
+    else:
+        directory = Path(value)
     if directory.is_absolute() or ".." in directory.parts:
         raise ValueError("output.directory must be a relative path without '..'")
     return directory
