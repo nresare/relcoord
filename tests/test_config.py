@@ -169,6 +169,23 @@ def test_settings_parses_output_entries(tmp_path: Path) -> None:
     assert settings.outputs[1].vars["cluster_name"] == "example-prod"
 
 
+def test_settings_defaults_output_directory_to_repository_root(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.outputs[0].directory == Path(".")
+
+
 def test_settings_rejects_output_with_non_scalar_vars(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(

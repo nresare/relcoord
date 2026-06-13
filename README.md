@@ -52,8 +52,9 @@ sort key `sk`. AWS credentials are resolved using the standard boto3 provider
 chain. For local development against DynamoDB Local, set `endpoint-url`.
 
 Manifest generation outputs are configured with `[[output]]` entries. Each
-output names a manifests repository, a directory inside that repository, and
-optional variables passed to `manifest-builder`:
+output names a manifests repository, an optional directory inside that
+repository, and optional variables passed to `manifest-builder`. When
+`directory` is omitted, manifests are written at the repository root:
 
 ```toml
 [[output]]
