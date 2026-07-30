@@ -1,0 +1,13 @@
+name: relcoord
+id: 'ari:cloud:compass:ca53ac44-e1d5-4f18-9b78-0cfa4ea53aa9:component/5a457f06-865e-415d-9c51-e5e2eff545dd/d61116e9-4bb0-4eca-a904-bf12e5d1d1b4'
+slug: relcoord
+configVersion: 1
+typeId: SERVICE
+ownerId: 'ari:cloud:identity::team/793aa195-1b2d-44e4-8fd5-6aa1f3c273e9'
+fields:
+  lifecycle: Active
+  tier: 2
+  isMonorepoProject: false
+links:
+  - type: REPOSITORY
+    url: 'https://github.com/portswigger-cloud/relcoord'
