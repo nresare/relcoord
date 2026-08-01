@@ -44,9 +44,11 @@ def test_retrying_store_raises_persistence_unavailable_after_exhaustion(
         store = FlakyStore(failures_before_success=3)
         retrying = RetryingImageInfoStore(store, sleep=sleep)
 
-        with pytest.raises(PersistenceUnavailableError) as exc_info:
-            with caplog.at_level(logging.ERROR, logger="relcoord.retrying_store"):
-                await retrying.latest_for_image("registry.example.com/team/api")
+        with (
+            pytest.raises(PersistenceUnavailableError) as exc_info,
+            caplog.at_level(logging.ERROR, logger="relcoord.retrying_store"),
+        ):
+            await retrying.latest_for_image("registry.example.com/team/api")
 
         assert exc_info.value.operation == "fetch latest image version"
         return sleep.delays

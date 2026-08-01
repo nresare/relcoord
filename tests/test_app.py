@@ -170,7 +170,7 @@ def test_register_accepts_opaque_version(client: TestClient) -> None:
     assert body["image"] == "registry.example.com/team/api"
     assert body["version"] == "release-2026-05-17"
     assert body["created"] is True
-    assert datetime.fromisoformat(body["timestamp"].replace("Z", "+00:00"))
+    assert datetime.fromisoformat(body["timestamp"])
 
 
 @pytest.mark.parametrize(

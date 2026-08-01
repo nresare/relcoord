@@ -66,7 +66,7 @@ class ImageVersionService:
             )
 
         try:
-            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(timestamp)
         except ValueError as exc:
             raise ValidationError(
                 error="invalid_timestamp",

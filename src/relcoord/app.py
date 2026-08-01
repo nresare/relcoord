@@ -140,7 +140,7 @@ def create_app(
             payload = await _read_json(request)
             image = ensure_string(payload, "image")
             version = ensure_string(payload, "version")
-            timestamp = payload["timestamp"] if "timestamp" in payload else None
+            timestamp = payload.get("timestamp")
             if "timestamp" in payload and timestamp is None:
                 raise ValidationError(
                     error="invalid_timestamp",
@@ -377,7 +377,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 async def _read_json(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
-    except Exception:
+    except ValueError:
         raise ValidationError(
             error="invalid_json",
             message="request body must be valid JSON",
@@ -445,7 +445,7 @@ def _persistence_unavailable(
         exc.operation,
         request.method,
         request.url.path,
-        exc_info=True,
+        exc_info=exc,
     )
     return _json_error(
         status_code=503,

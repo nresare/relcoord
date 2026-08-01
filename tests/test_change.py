@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from dulwich import porcelain
 from dulwich.errors import NotGitRepository
-import pytest
 
 from relcoord import change
 from relcoord.change import (

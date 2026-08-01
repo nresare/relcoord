@@ -72,7 +72,7 @@ class ChangeResult:
     manifests_checkout: Path
     generated_count: int
     deploy_id: str | None = None
-    outputs: tuple["OutputResult", ...] = ()
+    outputs: tuple[OutputResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -325,7 +325,7 @@ def _vars_log_summary(vars: dict[str, TemplateValue]) -> str:
 
 
 def _start_deployment_detection(
-    generation_result: object,
+    generation_result: GenerationResult,
     deploy_id: str | None,
     detector: DeploymentDetector | None,
 ) -> None:
@@ -334,8 +334,8 @@ def _start_deployment_detection(
             "manifest-builder did not return a deploy_id; "
             "deployment detection requires git-backed generation"
         )
-    created_or_modified = set(getattr(generation_result, "created_or_modified"))
-    removed = set(getattr(generation_result, "removed"))
+    created_or_modified = set(generation_result.created_or_modified)
+    removed = set(generation_result.removed)
     logger.info(
         "starting deployment detection for manifest-builder deploy-id %s",
         deploy_id,

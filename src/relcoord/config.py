@@ -25,7 +25,7 @@ class IdmouseSettings:
     token_path: Path
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "IdmouseSettings":
+    def from_mapping(cls, data: dict[str, Any]) -> IdmouseSettings:
         token_path = data.get("token-path")
         if not isinstance(data.get("url"), str) or not data["url"].strip():
             raise ValueError("persistence.idmouse.url must be a non-empty string")
@@ -51,7 +51,7 @@ class PersistenceSettings:
     endpoint_url: str | None = None
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "PersistenceSettings":
+    def from_mapping(cls, data: dict[str, Any]) -> PersistenceSettings:
         backend_value = _string_or_default(data, "backend", cls.backend)
         if backend_value not in ("in-memory", "surrealdb", "dynamodb"):
             raise ValueError(
@@ -94,7 +94,7 @@ class PersistenceSettings:
         if idmouse_data is None:
             raise ValueError("persistence.idmouse must be configured")
         if not isinstance(idmouse_data, dict):
-            raise ValueError("persistence.idmouse must be a table")
+            raise TypeError("persistence.idmouse must be a table")
 
         return cls(
             backend=backend,
@@ -112,7 +112,7 @@ class IdcatSettings:
     token_path: Path
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "IdcatSettings":
+    def from_mapping(cls, data: dict[str, Any]) -> IdcatSettings:
         endpoint = data.get("endpoint")
         github_app = data.get("github-app")
         token_path = data.get("token-path")
@@ -140,13 +140,13 @@ class OutputSettings:
     vars: dict[str, TemplateValue] = field(default_factory=dict)
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "OutputSettings":
+    def from_mapping(cls, data: dict[str, Any]) -> OutputSettings:
         name = _required_output_string(data, "name")
         repository = _required_output_string(data, "repository")
         directory = _required_output_directory(data)
         raw_vars = data.get("vars", {})
         if not isinstance(raw_vars, dict):
-            raise ValueError("output.vars must be a table")
+            raise TypeError("output.vars must be a table")
         return cls(
             name=name,
             repository=repository,
@@ -168,7 +168,7 @@ class Settings:
     roles: list[RoleConfig] = field(default_factory=list)
 
     @classmethod
-    def from_toml(cls, path: str | Path) -> "Settings":
+    def from_toml(cls, path: str | Path) -> Settings:
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
@@ -187,10 +187,10 @@ class Settings:
             raise ValueError("idcat must be a table")
         raw_roles = data.get("role", [])
         if not isinstance(raw_roles, list):
-            raise ValueError("role must be an array of tables")
+            raise TypeError("role must be an array of tables")
         raw_outputs = data.get("output", [])
         if not isinstance(raw_outputs, list):
-            raise ValueError("output must be an array of tables")
+            raise TypeError("output must be an array of tables")
         outputs = _outputs_from_entries(raw_outputs)
         manifests_repository = _optional_string(data, "manifests-repository")
         if manifests_repository is not None and outputs:
@@ -201,7 +201,7 @@ class Settings:
         seen: set[str] = set()
         for entry in raw_roles:
             if not isinstance(entry, dict):
-                raise ValueError("each role entry must be a table")
+                raise TypeError("each role entry must be a table")
             role = RoleConfig.from_mapping(entry)
             if role.name in seen:
                 raise ValueError(f"duplicate role '{role.name}'")
@@ -250,7 +250,7 @@ def _optional_string(data: dict[str, Any], key: str) -> str | None:
 def _bool_or_default(data: dict[str, Any], key: str, default: bool) -> bool:
     value = data.get(key, default)
     if not isinstance(value, bool):
-        raise ValueError(f"{key} must be a boolean")
+        raise TypeError(f"{key} must be a boolean")
     return value
 
 
@@ -280,7 +280,7 @@ def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:
     seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
-            raise ValueError("each output entry must be a table")
+            raise TypeError("each output entry must be a table")
         output = OutputSettings.from_mapping(entry)
         if output.name in seen:
             raise ValueError(f"duplicate output '{output.name}'")
@@ -309,6 +309,6 @@ def _output_vars(data: dict[str, Any]) -> dict[str, TemplateValue]:
         if not isinstance(key, str) or not key.strip():
             raise ValueError("output.vars keys must be non-empty strings")
         if not isinstance(value, str | int | float | bool):
-            raise ValueError(f"output.vars.{key} must be a string, number, or boolean")
+            raise TypeError(f"output.vars.{key} must be a string, number, or boolean")
         vars[key] = value
     return vars

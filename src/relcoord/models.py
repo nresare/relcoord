@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -25,4 +24,4 @@ class RegisterResult:
 @dataclass(frozen=True)
 class LatestVersionResult:
     image: str
-    version: Optional[str]
+    version: str | None

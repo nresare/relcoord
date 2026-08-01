@@ -10,8 +10,8 @@ from typing import Any
 import boto3
 from botocore.exceptions import (
     ClientError,
-    ConnectTimeoutError,
     ConnectionClosedError,
+    ConnectTimeoutError,
     EndpointConnectionError,
     ProxyConnectionError,
     ReadTimeoutError,
@@ -42,7 +42,7 @@ class DynamoDBImageInfoStore(ImageInfoStore):
         self._table_name = table_name
 
     @classmethod
-    async def connect(cls, config: PersistenceSettings) -> "DynamoDBImageInfoStore":
+    async def connect(cls, config: PersistenceSettings) -> DynamoDBImageInfoStore:
         if config.table_name is None:
             raise ValueError("DynamoDB persistence requires table-name")
         client = boto3.client(
@@ -212,7 +212,7 @@ def _timestamp_param(timestamp: datetime) -> str:
 
 
 def _as_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    return datetime.fromisoformat(value).astimezone(UTC)
 
 
 def _is_transaction_cancelled(exc: ClientError) -> bool:

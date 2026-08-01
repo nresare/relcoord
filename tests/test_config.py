@@ -228,7 +228,7 @@ def test_settings_rejects_output_with_non_scalar_vars(tmp_path: Path) -> None:
     )
 
     with pytest.raises(
-        ValueError,
+        TypeError,
         match="output.vars.cluster_names must be a string, number, or boolean",
     ):
         Settings.from_toml(config)
@@ -321,7 +321,7 @@ def test_settings_rejects_non_boolean_detect_deployment(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text('detect-deployment = "yes"\n')
 
-    with pytest.raises(ValueError, match="detect-deployment must be a boolean"):
+    with pytest.raises(TypeError, match="detect-deployment must be a boolean"):
         Settings.from_toml(config)
 
 

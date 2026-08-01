@@ -12,8 +12,8 @@ from typing import Any
 
 import httpx
 import surrealdb
-from websockets.exceptions import ConnectionClosed, WebSocketException
 from surrealdb import AsyncSurreal
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from relcoord.config import IdmouseSettings, PersistenceSettings
 from relcoord.errors import TimestampConflictError
@@ -92,7 +92,7 @@ class SurrealImageInfoStore(ImageInfoStore):
         self._renew_task: asyncio.Task[None] | None = None
 
     @classmethod
-    async def connect(cls, config: PersistenceSettings) -> "SurrealImageInfoStore":
+    async def connect(cls, config: PersistenceSettings) -> SurrealImageInfoStore:
         if config.uri is None or config.idmouse is None:
             raise ValueError("SurrealDB persistence requires uri and idmouse settings")
         db = AsyncSurreal(config.uri)
@@ -303,7 +303,7 @@ def _as_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value.astimezone(UTC)
     if isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+        return datetime.fromisoformat(value).astimezone(UTC)
     raise TypeError(f"Expected datetime-compatible value, got {type(value)!r}")
 
 

@@ -12,8 +12,7 @@ import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from jwt import PyJWK
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 from starlette.testclient import TestClient
@@ -176,7 +175,7 @@ def test_role_config_from_mapping_defaults_allow_system_to_false() -> None:
 
 
 def test_role_config_from_mapping_rejects_non_boolean_allow_system() -> None:
-    with pytest.raises(ValueError, match="allow_system must be a boolean"):
+    with pytest.raises(TypeError, match="allow_system must be a boolean"):
         RoleConfig.from_mapping(
             {
                 "name": "default",
@@ -403,9 +402,11 @@ def test_validator_logs_wrong_audience(
     validator = _make_validator([_role()], signing_key)
     token = _make_token(private_pem, audience="other")
 
-    with caplog.at_level(logging.WARNING, logger="relcoord.auth"):
-        with pytest.raises(AuthError):
-            validator.validate(token)
+    with (
+        caplog.at_level(logging.WARNING, logger="relcoord.auth"),
+        pytest.raises(AuthError),
+    ):
+        validator.validate(token)
 
     assert "audience validation failed" in caplog.text
     assert "aud='other'" in caplog.text
@@ -422,9 +423,11 @@ def test_validator_logs_signature_validation_failure(
     ).decode()
     validator = _make_validator([_role()], signing_key)
 
-    with caplog.at_level(logging.WARNING, logger="relcoord.auth"):
-        with pytest.raises(AuthError):
-            validator.validate(_make_token(other_private_pem))
+    with (
+        caplog.at_level(logging.WARNING, logger="relcoord.auth"),
+        pytest.raises(AuthError),
+    ):
+        validator.validate(_make_token(other_private_pem))
 
     assert "signature validation failed" in caplog.text
 

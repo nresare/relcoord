@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 from __future__ import annotations
 
-import shutil
-import tempfile
 import logging
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -170,8 +170,7 @@ def github_repo_from_url(source: str) -> GithubRepo | None:
         return None
 
     name = components[1]
-    if name.endswith(".git"):
-        name = name[:-4]
+    name = name.removesuffix(".git")
     if not components[0] or not name:
         return None
     return GithubRepo(owner=components[0], name=name)
@@ -197,8 +196,7 @@ def ssh_style_git_uri_from_url(source: str) -> SshStyleGitUri | None:
         return None
 
     name = components[1]
-    if name.endswith(".git"):
-        name = name[:-4]
+    name = name.removesuffix(".git")
     if not components[0] or not name:
         return None
     return SshStyleGitUri(hostname=hostname, owner=components[0], name=name)

@@ -11,7 +11,6 @@ from typing import Any
 
 import httpx
 import jwt
-from jwt import algorithms
 from jwt import (
     DecodeError,
     ExpiredSignatureError,
@@ -26,6 +25,7 @@ from jwt import (
     PyJWK,
     PyJWKClient,
     PyJWKClientError,
+    algorithms,
 )
 from jwt.algorithms import HMACAlgorithm, NoneAlgorithm
 
@@ -57,7 +57,7 @@ class RoleConfig:
     allow_system: bool = False
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "RoleConfig":
+    def from_mapping(cls, data: dict[str, Any]) -> RoleConfig:
         name = _required_string(data, "name", context="role")
         audience = _required_string(data, "audience", context=f"role '{name}'")
         issuer = _required_string(data, "issuer", context=f"role '{name}'")
@@ -70,7 +70,7 @@ class RoleConfig:
 
         raw_claims = data.get("claims", {})
         if not isinstance(raw_claims, dict):
-            raise ValueError(f"role '{name}' claims must be a table")
+            raise TypeError(f"role '{name}' claims must be a table")
         claims: dict[str, str] = {}
         for key, value in raw_claims.items():
             if not isinstance(key, str) or not key:
@@ -380,7 +380,7 @@ def _jwks_uri_for_role(role: RoleConfig) -> str:
         ) from exc
 
     if not isinstance(openid_configuration, dict):
-        raise ValueError(
+        raise TypeError(
             f"OpenID configuration for role '{role.name}' must be a JSON object"
         )
 
@@ -454,5 +454,5 @@ def _optional_bool(
     if value is None:
         return False
     if not isinstance(value, bool):
-        raise ValueError(f"{context} {key} must be a boolean")
+        raise TypeError(f"{context} {key} must be a boolean")
     return value

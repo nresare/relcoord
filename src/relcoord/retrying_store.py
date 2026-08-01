@@ -89,13 +89,12 @@ class RetryingImageInfoStore(ImageInfoStore):
                 raise
             except self._transient_exceptions as exc:
                 if attempt >= self._attempts:
-                    logger.error(
+                    logger.exception(
                         "Persistence operation %s failed after %s attempt(s) "
                         "against backend %s",
                         operation,
                         attempt,
                         type(self._store).__name__,
-                        exc_info=True,
                     )
                     raise PersistenceUnavailableError(operation) from exc
 

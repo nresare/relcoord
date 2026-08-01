@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Iterable, Optional
 
 from relcoord.models import RegisterResult
 
@@ -23,13 +23,11 @@ class ImageInfoStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def latest_for_image(self, image: str) -> Optional[str]:
+    async def latest_for_image(self, image: str) -> str | None:
         raise NotImplementedError
 
-    async def latest_for_images(
-        self, images: Iterable[str]
-    ) -> dict[str, Optional[str]]:
-        results: dict[str, Optional[str]] = {}
+    async def latest_for_images(self, images: Iterable[str]) -> dict[str, str | None]:
+        results: dict[str, str | None] = {}
         for image in images:
             if image not in results:
                 results[image] = await self.latest_for_image(image)
