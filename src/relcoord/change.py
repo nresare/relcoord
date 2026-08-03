@@ -243,14 +243,9 @@ class ChangeProcessor:
                         **selection,
                     )
                     generated = _written_paths(generation_result)
-                    relative_paths = [
-                        str(path.relative_to(output_path)) for path in sorted(generated)
-                    ]
-                    generated_paths = ", ".join(relative_paths)
                     message = (
                         f"manifest-builder generated {len(generated)} file(s) "
                         f"for output {output.name}"
-                        f"{f': {generated_paths}' if generated_paths else ''}"
                     )
                     logger.info("change step 5/7: %s", message)
                     report(
@@ -259,7 +254,6 @@ class ChangeProcessor:
                         output=output.name,
                         repository=repository,
                         generated=len(generated),
-                        paths=relative_paths,
                     )
                     deploy_id = _deploy_id(generation_result)
                     if self.detect_deployment and deploy_id is None:

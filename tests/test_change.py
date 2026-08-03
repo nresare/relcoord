@@ -230,7 +230,7 @@ def test_change_processor_reports_progress_for_each_step(
     assert by_phase["deploy-config"].detail["namespace"] == "config"
     assert by_phase["deploy-config"].detail["system"] is False
     assert by_phase["generated"].detail["generated"] == 1
-    assert by_phase["generated"].detail["paths"] == ["api.yaml"]
+    assert "paths" not in by_phase["generated"].detail
     assert by_phase["push"].detail == {
         "repository": "https://github.com/acme/manifests.git",
         "manifest_commit": "feedface",
