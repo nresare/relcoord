@@ -1148,6 +1148,36 @@ def test_change_streams_progress_when_client_accepts_event_stream() -> None:
     }
 
 
+def test_change_stream_does_not_lose_progress_reported_before_draining() -> None:
+    """Progress must survive a processor that finishes before the queue is read.
+
+    Whether the change completes before or after the stream starts draining is a
+    scheduling race, so this repeats the request: resolving the worker thread's
+    future must never overtake the progress events that thread queued ahead of
+    it. A single attempt would pass even with that ordering broken.
+    """
+    for _ in range(20):
+        client = streaming_client(
+            [
+                ChangeProgress(phase="workspace", message="created workspace"),
+                ChangeProgress(phase="pushed", message="pushed manifests commit"),
+            ]
+        )
+
+        response = client.post(
+            "/v1/change",
+            json={"config_repo": "acme/config", "commit": "deadbeef"},
+            headers={"accept": "text/event-stream"},
+        )
+
+        assert [name for name, _ in parse_sse(response.text)] == [
+            "accepted",
+            "progress",
+            "progress",
+            "complete",
+        ], response.text
+
+
 class BlockingProcessor:
     """A processor that waits for the test to release it mid-change."""
 

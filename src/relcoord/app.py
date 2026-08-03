@@ -612,10 +612,9 @@ async def _change_events(
         # Called on the worker thread running the change processor.
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
-    async def run() -> object:
+    def process_then_close() -> object:
         try:
-            return await asyncio.to_thread(
-                change_processor.process,
+            return change_processor.process(
                 plan.repo,
                 plan.commit,
                 plan.manifest_image,
@@ -624,12 +623,15 @@ async def _change_events(
                 progress=sink,
             )
         finally:
-            # asyncio runs the callbacks scheduled by sink() before the one that
-            # resolves the to_thread future, so every progress event is already
-            # queued by the time this sentinel lands behind them.
-            queue.put_nowait(None)
+            # The sentinel has to be posted from the worker thread through the
+            # same call_soon_threadsafe path as the progress events: those are
+            # then strictly ordered ahead of it. Closing the queue from the
+            # awaiting coroutine instead would race, because resolving the
+            # to_thread future can overtake callbacks the worker thread queued
+            # before it.
+            loop.call_soon_threadsafe(queue.put_nowait, None)
 
-    task = asyncio.create_task(run())
+    task = asyncio.create_task(asyncio.to_thread(process_then_close))
     outcome_reported = False
     try:
         yield _sse_event(
