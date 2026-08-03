@@ -6,6 +6,9 @@ import logging
 import re
 import shutil
 import tempfile
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -17,6 +20,9 @@ from dulwich import porcelain
 from relcoord.config import IdcatSettings
 
 GITHUB_TOKEN_USERNAME = "x-access-token"
+# idcat installation tokens are valid for 3600 seconds; expire them a little
+# early so a cached token is not handed out just before it stops working.
+INSTALLATION_TOKEN_TTL_SECONDS = 3300.0
 _SCP_STYLE_GIT_URI = re.compile(r"(?:[^@/:]+@)?([^/:]+):(.+)")
 _SSH_STYLE_SCHEMES = {"ssh", "git+ssh"}
 logger = logging.getLogger(__name__)
@@ -50,6 +56,58 @@ class GitCredentialError(Exception):
 class GitCredentials:
     username: str | None = None
     password: str | None = None
+
+
+@dataclass(frozen=True)
+class InstallationTokenKey:
+    endpoint: str
+    github_app: str
+    owner: str
+    name: str
+
+
+class InstallationTokenCache:
+    """Caches idcat installation tokens per target repository."""
+
+    def __init__(
+        self,
+        ttl_seconds: float = INSTALLATION_TOKEN_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._tokens: dict[InstallationTokenKey, tuple[float, str]] = {}
+
+    def get_or_fetch(self, key: InstallationTokenKey, fetch: Callable[[], str]) -> str:
+        with self._lock:
+            entry = self._tokens.get(key)
+            if entry is not None and entry[0] > self._clock():
+                logger.debug(
+                    "Using cached idcat installation token for %s/%s",
+                    key.owner,
+                    key.name,
+                )
+                return entry[1]
+
+        token = fetch()
+
+        with self._lock:
+            now = self._clock()
+            self._tokens = {
+                cached_key: cached
+                for cached_key, cached in self._tokens.items()
+                if cached[0] > now
+            }
+            self._tokens[key] = (now + self._ttl_seconds, token)
+        return token
+
+    def clear(self) -> None:
+        with self._lock:
+            self._tokens.clear()
+
+
+installation_token_cache = InstallationTokenCache()
 
 
 def clone_repository(
@@ -100,18 +158,34 @@ def github_https_credentials(
     if repo is None or idcat is None:
         return GitCredentials()
 
-    try:
-        bearer_token = idcat.bearer_token()
-    except OSError as exc:
-        raise GitCredentialError(
-            f"failed to read idcat token-path {idcat.token_path}: {exc}"
-        ) from exc
-
-    installation_token = fetch_installation_token(idcat, repo, bearer_token)
+    installation_token = installation_token_cache.get_or_fetch(
+        installation_token_key(idcat, repo),
+        lambda: fetch_installation_token(idcat, repo, idcat_bearer_token(idcat)),
+    )
     return GitCredentials(
         username=GITHUB_TOKEN_USERNAME,
         password=installation_token,
     )
+
+
+def installation_token_key(
+    idcat: IdcatSettings, repo: GithubRepo
+) -> InstallationTokenKey:
+    return InstallationTokenKey(
+        endpoint=idcat.endpoint,
+        github_app=idcat.github_app,
+        owner=repo.owner,
+        name=repo.name,
+    )
+
+
+def idcat_bearer_token(idcat: IdcatSettings) -> str:
+    try:
+        return idcat.bearer_token()
+    except OSError as exc:
+        raise GitCredentialError(
+            f"failed to read idcat token-path {idcat.token_path}: {exc}"
+        ) from exc
 
 
 def fetch_installation_token(

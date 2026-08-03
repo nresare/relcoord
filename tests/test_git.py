@@ -12,7 +12,10 @@ from relcoord.config import IdcatSettings
 from relcoord.git import (
     GitCredentialError,
     GithubRepo,
+    InstallationTokenCache,
+    InstallationTokenKey,
     clone_repository,
+    github_https_credentials,
     github_https_url_from_ssh_style_uri,
     github_repo_from_url,
     installation_token_url,
@@ -88,6 +91,123 @@ def test_clone_repository_fetches_github_credentials_from_idcat(
     )
     assert clone.call_args.kwargs["username"] == "x-access-token"
     assert clone.call_args.kwargs["password"] == "github-installation-token"
+
+
+def _idcat_response(url: str, token: str) -> httpx.Response:
+    return httpx.Response(200, text=f"{token}\n", request=httpx.Request("POST", url))
+
+
+def test_github_https_credentials_reuses_cached_token_for_same_repo(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "idcat-token"
+    token_file.write_text("idcat-bearer-token\n")
+    idcat = IdcatSettings(
+        endpoint="https://idcat.example.test/base",
+        github_app="deployments",
+        token_path=token_file,
+    )
+    url = "https://idcat.example.test/base/installation-token/deployments/acme/api"
+
+    with patch("relcoord.git.httpx.post") as post:
+        post.return_value = _idcat_response(url, "github-installation-token")
+
+        first = github_https_credentials("https://github.com/acme/api.git", idcat)
+        second = github_https_credentials(
+            "https://github.com/acme/api.git/info/refs", idcat
+        )
+
+    assert first == second
+    assert first.password == "github-installation-token"
+    post.assert_called_once()
+
+
+def test_github_https_credentials_caches_per_repository(tmp_path: Path) -> None:
+    token_file = tmp_path / "idcat-token"
+    token_file.write_text("idcat-bearer-token\n")
+    idcat = IdcatSettings(
+        endpoint="https://idcat.example.test/base",
+        github_app="deployments",
+        token_path=token_file,
+    )
+
+    with patch("relcoord.git.httpx.post") as post:
+        post.side_effect = [
+            _idcat_response(
+                "https://idcat.example.test/base/installation-token/deployments/acme/api",
+                "api-token",
+            ),
+            _idcat_response(
+                "https://idcat.example.test/base/installation-token/deployments/acme/web",
+                "web-token",
+            ),
+        ]
+
+        api = github_https_credentials("https://github.com/acme/api.git", idcat)
+        web = github_https_credentials("https://github.com/acme/web.git", idcat)
+        api_again = github_https_credentials("https://github.com/acme/api.git", idcat)
+
+    assert api.password == "api-token"
+    assert web.password == "web-token"
+    assert api_again.password == "api-token"
+    assert post.call_count == 2
+
+
+def test_github_https_credentials_does_not_read_bearer_token_on_cache_hit(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "idcat-token"
+    token_file.write_text("idcat-bearer-token\n")
+    idcat = IdcatSettings(
+        endpoint="https://idcat.example.test/base",
+        github_app="deployments",
+        token_path=token_file,
+    )
+    url = "https://idcat.example.test/base/installation-token/deployments/acme/api"
+
+    with patch("relcoord.git.httpx.post") as post:
+        post.return_value = _idcat_response(url, "github-installation-token")
+        github_https_credentials("https://github.com/acme/api.git", idcat)
+        token_file.unlink()
+        credentials = github_https_credentials("https://github.com/acme/api.git", idcat)
+
+    assert credentials.password == "github-installation-token"
+
+
+def test_installation_token_cache_refetches_after_ttl_expires() -> None:
+    now = 0.0
+    cache = InstallationTokenCache(ttl_seconds=3300.0, clock=lambda: now)
+    key = InstallationTokenKey(
+        endpoint="https://idcat.example.test",
+        github_app="deployments",
+        owner="acme",
+        name="api",
+    )
+    tokens = iter(["first-token", "second-token"])
+
+    assert cache.get_or_fetch(key, lambda: next(tokens)) == "first-token"
+    now = 3299.0
+    assert cache.get_or_fetch(key, lambda: next(tokens)) == "first-token"
+    now = 3300.0
+    assert cache.get_or_fetch(key, lambda: next(tokens)) == "second-token"
+
+
+def test_installation_token_cache_does_not_cache_failed_fetches() -> None:
+    cache = InstallationTokenCache()
+    key = InstallationTokenKey(
+        endpoint="https://idcat.example.test",
+        github_app="deployments",
+        owner="acme",
+        name="api",
+    )
+
+    def failing_fetch() -> str:
+        raise GitCredentialError("idcat returned HTTP 401: not allowed")
+
+    with pytest.raises(GitCredentialError):
+        cache.get_or_fetch(key, failing_fetch)
+
+    assert cache.get_or_fetch(key, lambda: "token") == "token"
 
 
 def test_clone_repository_reports_missing_idcat_token_file(tmp_path: Path) -> None:
