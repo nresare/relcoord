@@ -1,18 +1,32 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
+import asyncio
+import json
 import logging
+import threading
+from collections.abc import Callable, MutableMapping
 from datetime import datetime
+from typing import Any
 
 import pytest
+from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
+from relcoord import app
 from relcoord.app import (
     NoopChangeProcessor,
     NoopTokenValidator,
     RequestTokenValidator,
     create_app,
 )
-from relcoord.change import CredentialError, DeployConfigError, GitTransportError
+from relcoord.change import (
+    ChangeProgress,
+    CredentialError,
+    DeployConfigError,
+    GitTransportError,
+    ProgressSink,
+    ignore_progress,
+)
 from relcoord.errors import PersistenceUnavailableError
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.models import RegisterResult
@@ -292,6 +306,8 @@ def test_change_passes_image_reference_to_processor() -> None:
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 1})()
@@ -363,6 +379,8 @@ def test_change_processes_deploy_config_when_processor_is_configured(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 3})()
@@ -414,6 +432,8 @@ def test_change_processor_logs_from_worker_thread(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             logging.getLogger("relcoord.change").info(
                 "processor logged for %s at %s with image %s", repo, commit, image
@@ -456,6 +476,8 @@ def test_change_converts_github_ssh_style_repo_uri() -> None:
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             self.calls.append((repo, commit, image))
             return type("Result", (), {"generated_count": 0})()
@@ -530,6 +552,8 @@ def test_change_reports_missing_deploy_config(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             raise DeployConfigError("missing .deploy")
 
@@ -572,6 +596,8 @@ def test_change_reports_credential_error_without_traceback(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             raise CredentialError(
                 "failed to obtain git credentials while checking out source repo "
@@ -622,6 +648,8 @@ def test_change_reports_git_transport_error_without_traceback(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             raise GitTransportError(
                 "dulwich clone failed: dulwich.errors.NotGitRepository"
@@ -668,6 +696,8 @@ def _config_path_recording_client() -> tuple[TestClient, list[str]]:
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             config_paths.append(config_path)
             return type("Result", (), {"generated_count": 0})()
@@ -757,6 +787,8 @@ def _system_recording_client(
             image: str | None,
             config_path: str = ".deploy",
             system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
         ) -> object:
             systems.append(system)
             return type("Result", (), {"generated_count": 0})()
@@ -1000,3 +1032,347 @@ def test_reject_timestamp_conflict(client: TestClient) -> None:
     assert first.status_code == 201
     assert second.status_code == 400
     assert second.json()["error"] == "timestamp_conflict"
+
+
+def parse_sse(body: str) -> list[tuple[str, dict[str, Any]]]:
+    """Parse an SSE body into (event name, decoded data) pairs, ignoring comments."""
+    events: list[tuple[str, dict[str, Any]]] = []
+    for block in body.split("\n\n"):
+        name: str | None = None
+        data: str | None = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = line.removeprefix("data: ")
+        if name is not None and data is not None:
+            events.append((name, json.loads(data)))
+    return events
+
+
+class ReportingProcessor:
+    """A processor that reports the progress steps it is constructed with."""
+
+    def __init__(
+        self, steps: list[ChangeProgress], failure: Exception | None = None
+    ) -> None:
+        self._steps = steps
+        self._failure = failure
+
+    def process(
+        self,
+        repo: str,
+        commit: str,
+        image: str | None,
+        config_path: str = ".deploy",
+        system: bool = False,
+        *,
+        progress: ProgressSink = ignore_progress,
+    ) -> object:
+        for step in self._steps:
+            progress(step)
+        if self._failure is not None:
+            raise self._failure
+        return type("Result", (), {"generated_count": len(self._steps)})()
+
+
+def streaming_client(
+    steps: list[ChangeProgress], failure: Exception | None = None
+) -> TestClient:
+    return TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=ReportingProcessor(steps, failure),
+        )
+    )
+
+
+def test_change_streams_progress_when_client_accepts_event_stream() -> None:
+    client = streaming_client(
+        [
+            ChangeProgress(
+                phase="source-checkout",
+                message="checking out source repo acme/config at commit deadbeef",
+                detail={"repo": "acme/config", "commit": "deadbeef"},
+            ),
+            ChangeProgress(
+                phase="generated",
+                message="manifest-builder generated 2 file(s) for output manifests",
+                detail={"generated": 2},
+            ),
+        ]
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "acme/config",
+            "commit": "deadbeef",
+            "image_repo": "registry.example.com/team/api",
+            "tag": "1.2.3",
+        },
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 202
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == [
+        "accepted",
+        "progress",
+        "progress",
+        "complete",
+    ]
+
+    accepted = events[0][1]
+    assert accepted["config_repo"] == "acme/config"
+    assert accepted["commit"] == "deadbeef"
+    registered = accepted["registered"]
+    assert registered["version"] == "1.2.3"
+
+    assert events[1][1] == {
+        "phase": "source-checkout",
+        "message": "checking out source repo acme/config at commit deadbeef",
+        "detail": {"repo": "acme/config", "commit": "deadbeef"},
+    }
+    assert events[2][1]["phase"] == "generated"
+    assert events[3][1] == {
+        "config_repo": "acme/config",
+        "commit": "deadbeef",
+        "registered": registered,
+        "processed": {"generated": 2},
+    }
+
+
+class BlockingProcessor:
+    """A processor that waits for the test to release it mid-change."""
+
+    def __init__(self, released: threading.Event) -> None:
+        self._released = released
+
+    def process(
+        self,
+        repo: str,
+        commit: str,
+        image: str | None,
+        config_path: str = ".deploy",
+        system: bool = False,
+        *,
+        progress: ProgressSink = ignore_progress,
+    ) -> object:
+        progress(ChangeProgress(phase="workspace", message="created workspace"))
+        if not self._released.wait(timeout=10):
+            raise AssertionError("the event stream never observed the first step")
+        progress(ChangeProgress(phase="pushed", message="pushed manifests commit"))
+        return type("Result", (), {"generated_count": 1})()
+
+
+async def collect_change_chunks(
+    application: Starlette,
+    payload: dict[str, object],
+    release: threading.Event,
+    release_when: Callable[[list[bytes]], bool],
+) -> tuple[int, list[bytes]]:
+    """Drive the ASGI app directly, collecting body chunks as they are sent.
+
+    Starlette's TestClient buffers the whole response before handing it back, so
+    observing genuinely incremental delivery means speaking ASGI. ``release`` is
+    set as soon as ``release_when`` accepts the chunks received so far, which
+    lets a test unblock the change processor only after the stream has already
+    delivered something.
+    """
+    body = json.dumps(payload).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/v1/change",
+        "raw_path": b"/v1/change",
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+            (b"accept", b"text/event-stream"),
+        ],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    request_messages: list[MutableMapping[str, Any]] = [
+        {"type": "http.request", "body": body, "more_body": False}
+    ]
+    chunks: list[bytes] = []
+    status = 0
+
+    async def receive() -> MutableMapping[str, Any]:
+        if request_messages:
+            return request_messages.pop(0)
+        # Never disconnect; the response ends when the stream does.
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        nonlocal status
+        if message["type"] == "http.response.start":
+            status = message["status"]
+        elif message["type"] == "http.response.body":
+            chunk = message.get("body", b"")
+            if chunk:
+                chunks.append(chunk)
+                if not release.is_set() and release_when(chunks):
+                    release.set()
+
+    await application(scope, receive, send)
+    return status, chunks
+
+
+def test_change_streams_progress_before_the_change_completes() -> None:
+    released = threading.Event()
+    application = create_app(
+        InMemoryImageInfoStore(),
+        token_validator=NoopTokenValidator(),
+        change_processor=BlockingProcessor(released),
+    )
+
+    status, chunks = asyncio.run(
+        collect_change_chunks(
+            application,
+            {"config_repo": "acme/config", "commit": "deadbeef"},
+            released,
+            # The processor stays blocked until its first step has been sent, so
+            # reaching the end at all proves the response is not buffered.
+            lambda chunks: any(b"created workspace" in chunk for chunk in chunks),
+        )
+    )
+
+    assert status == 202
+    assert [name for name, _ in parse_sse(b"".join(chunks).decode())] == [
+        "accepted",
+        "progress",
+        "progress",
+        "complete",
+    ]
+    # Each event is flushed on its own rather than coalesced into one body.
+    assert len(chunks) >= 4
+
+
+def test_change_stream_sends_heartbeats_while_a_step_is_slow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app, "_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    released = threading.Event()
+    application = create_app(
+        InMemoryImageInfoStore(),
+        token_validator=NoopTokenValidator(),
+        change_processor=BlockingProcessor(released),
+    )
+
+    _status, chunks = asyncio.run(
+        collect_change_chunks(
+            application,
+            {"config_repo": "acme/config", "commit": "deadbeef"},
+            released,
+            lambda chunks: sum(chunk.startswith(b":") for chunk in chunks) >= 2,
+        )
+    )
+
+    assert sum(chunk.startswith(b": keep-alive") for chunk in chunks) >= 2
+
+
+def test_change_streams_terminal_error_event_when_processing_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = streaming_client(
+        [ChangeProgress(phase="workspace", message="created temporary workspace")],
+        failure=GitTransportError("dulwich clone failed: NotGitRepository"),
+    )
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    # The status is committed before the change runs, so the failure is in band.
+    assert response.status_code == 202
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == ["accepted", "progress", "error"]
+    assert events[2][1] == {
+        "status": 502,
+        "error": "git_transport_failed",
+        "message": "dulwich clone failed: NotGitRepository",
+    }
+    assert (
+        "Git transport failure while processing change for repo acme/config "
+        "at commit deadbeef" in caplog.text
+    )
+
+
+def test_change_rejects_invalid_payload_with_status_code_when_streaming(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/v1/change",
+        json={"commit": "abc123"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_config_repo"
+
+
+def test_change_returns_json_when_event_stream_is_not_accepted() -> None:
+    client = streaming_client(
+        [ChangeProgress(phase="workspace", message="created temporary workspace")]
+    )
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef"},
+        headers={"accept": "*/*"},
+    )
+
+    assert response.status_code == 202
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {
+        "config_repo": "acme/config",
+        "commit": "deadbeef",
+        "registered": None,
+        "processed": {"generated": 1},
+    }
+
+
+@pytest.mark.parametrize(
+    ("accept", "streams"),
+    [
+        ("text/event-stream", True),
+        ("text/event-stream;q=0.9", True),
+        ("application/json, text/event-stream", True),
+        ("TEXT/EVENT-STREAM", True),
+        ("*/*", False),
+        ("application/json", False),
+        ("", False),
+    ],
+)
+def test_change_negotiates_event_stream_on_accept_header(
+    accept: str, streams: bool
+) -> None:
+    client = streaming_client([])
+
+    response = client.post(
+        "/v1/change",
+        json={"config_repo": "acme/config", "commit": "deadbeef"},
+        headers={"accept": accept},
+    )
+
+    assert response.status_code == 202
+    is_stream = response.headers["content-type"].startswith("text/event-stream")
+    assert is_stream is streams

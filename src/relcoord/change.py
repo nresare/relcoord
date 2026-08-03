@@ -6,8 +6,8 @@ import logging
 import shutil
 import tempfile
 import threading
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -65,6 +65,27 @@ class DeploymentDetector(Protocol):
 
 
 @dataclass(frozen=True)
+class ChangeProgress:
+    """A step reported by :meth:`ChangeProcessor.process` as it happens.
+
+    ``phase`` names the kind of step and is the stable part of the contract;
+    ``message`` is human readable and intended for display; ``detail`` carries
+    JSON serialisable specifics of the step.
+    """
+
+    phase: str
+    message: str
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+ProgressSink = Callable[[ChangeProgress], None]
+
+
+def ignore_progress(event: ChangeProgress) -> None:
+    """Discard progress events, for callers that do not observe them."""
+
+
+@dataclass(frozen=True)
 class ChangeResult:
     repo: str
     commit: str
@@ -100,7 +121,12 @@ class ChangeProcessor:
         image: str | None,
         config_path: str = ".deploy",
         system: bool = False,
+        *,
+        progress: ProgressSink = ignore_progress,
     ) -> ChangeResult:
+        def report(phase: str, message: str, **detail: Any) -> None:
+            progress(ChangeProgress(phase=phase, message=message, detail=detail))
+
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-change-"))
         try:
             source_checkout = workdir / "source"
@@ -108,17 +134,15 @@ class ChangeProcessor:
             checkout_by_repository = _checkout_paths_by_repository(
                 workdir, output_settings
             )
-            logger.info(
-                "change step 1/7: created temporary workspace %s for repo %s at commit %s",
-                workdir,
-                repo,
-                commit,
+            message = (
+                f"created temporary workspace {workdir} for repo {repo} "
+                f"at commit {commit}"
             )
-            logger.info(
-                "change step 2/7: checking out source repo %s at commit %s",
-                repo,
-                commit,
-            )
+            logger.info("change step 1/7: %s", message)
+            report("workspace", message, workdir=str(workdir))
+            message = f"checking out source repo {repo} at commit {commit}"
+            logger.info("change step 2/7: %s", message)
+            report("source-checkout", message, repo=repo, commit=commit)
             _checkout_commit(repo, commit, source_checkout, self.idcat)
             if system:
                 # System mode: config lives at the repository root and
@@ -135,10 +159,14 @@ class ChangeProcessor:
                         f"commit {commit} in {repo} does not contain "
                         f"a {config_path} directory"
                     )
-            logger.info(
-                "change step 3/7: found deploy config at %s (system mode: %s)",
-                deploy_config,
-                system,
+            message = f"found deploy config at {deploy_config} (system mode: {system})"
+            logger.info("change step 3/7: %s", message)
+            report(
+                "deploy-config",
+                message,
+                deploy_config=str(deploy_config),
+                system=system,
+                namespace=namespace,
             )
 
             repo_root = Path("/")
@@ -148,11 +176,9 @@ class ChangeProcessor:
 
             for repository, manifests_checkout in checkout_by_repository.items():
                 detection_results: list[tuple[GenerationResult, str | None]] = []
-                logger.info(
-                    "change step 4/7: checking out manifests repo %s into %s",
-                    repository,
-                    manifests_checkout,
-                )
+                message = f"checking out manifests repo {repository} into {manifests_checkout}"
+                logger.info("change step 4/7: %s", message)
+                report("manifests-checkout", message, repository=repository)
                 _clone_repository(
                     repository,
                     manifests_checkout,
@@ -178,6 +204,13 @@ class ChangeProcessor:
                         namespace,
                         _vars_log_summary(output.vars),
                     )
+                    report(
+                        "generate",
+                        f"invoking manifest-builder for output {output.name}",
+                        output=output.name,
+                        repository=repository,
+                        directory=str(output.directory),
+                    )
                     generation_result = generate(
                         deploy_config,
                         output_path,
@@ -188,15 +221,23 @@ class ChangeProcessor:
                         vars=output.vars,
                     )
                     generated = _written_paths(generation_result)
-                    generated_paths = ", ".join(
+                    relative_paths = [
                         str(path.relative_to(output_path)) for path in sorted(generated)
+                    ]
+                    generated_paths = ", ".join(relative_paths)
+                    message = (
+                        f"manifest-builder generated {len(generated)} file(s) "
+                        f"for output {output.name}"
+                        f"{f': {generated_paths}' if generated_paths else ''}"
                     )
-                    logger.info(
-                        "change step 5/7: manifest-builder generated %d file(s) "
-                        "for output %s%s",
-                        len(generated),
-                        output.name,
-                        f": {generated_paths}" if generated_paths else "",
+                    logger.info("change step 5/7: %s", message)
+                    report(
+                        "generated",
+                        message,
+                        output=output.name,
+                        repository=repository,
+                        generated=len(generated),
+                        paths=relative_paths,
                     )
                     deploy_id = _deploy_id(generation_result)
                     if self.detect_deployment and deploy_id is None:
@@ -221,38 +262,56 @@ class ChangeProcessor:
                     result.created_or_modified or result.removed
                     for result, _ in detection_results
                 ):
-                    logger.info(
-                        "change step 6/7: manifest-builder produced no changes for "
-                        "repo %s; nothing to commit or push",
-                        repository,
+                    message = (
+                        f"manifest-builder produced no changes for repo {repository}; "
+                        "nothing to commit or push"
                     )
+                    logger.info("change step 6/7: %s", message)
+                    report("no-changes", message, repository=repository)
                     continue
 
                 manifest_commit = _head_commit(manifests_checkout)
-                logger.info(
-                    "change step 6/7: manifest-builder created manifests commit %s",
-                    manifest_commit,
+                message = f"manifest-builder created manifests commit {manifest_commit}"
+                logger.info("change step 6/7: %s", message)
+                report(
+                    "commit",
+                    message,
+                    repository=repository,
+                    manifest_commit=manifest_commit,
                 )
-                logger.info(
-                    "change step 7/7: pushing manifests commit %s to %s",
-                    manifest_commit,
-                    repository,
+                message = f"pushing manifests commit {manifest_commit} to {repository}"
+                logger.info("change step 7/7: %s", message)
+                report(
+                    "push",
+                    message,
+                    repository=repository,
+                    manifest_commit=manifest_commit,
                 )
                 _push_repository(
                     manifests_checkout,
                     repository,
                     self.idcat,
                 )
-                logger.info(
-                    "change complete: pushed manifests commit %s for source repo %s "
-                    "at commit %s",
-                    manifest_commit,
-                    repo,
-                    commit,
+                message = (
+                    f"pushed manifests commit {manifest_commit} for source repo "
+                    f"{repo} at commit {commit}"
+                )
+                logger.info("change complete: %s", message)
+                report(
+                    "pushed",
+                    message,
+                    repository=repository,
+                    manifest_commit=manifest_commit,
                 )
 
                 if self.detect_deployment:
                     for generation_result, deploy_id in detection_results:
+                        report(
+                            "deployment-detection",
+                            "waiting for deployment of manifest-builder deploy-id "
+                            f"{deploy_id}",
+                            deploy_id=deploy_id,
+                        )
                         _start_deployment_detection(
                             generation_result,
                             deploy_id,

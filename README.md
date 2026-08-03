@@ -2,6 +2,43 @@
 
 Small HTTP service for registering image versions and resolving the latest known version per image.
 
+## Progress streaming
+
+`POST /v1/change` normally answers with a single `202` JSON body once the change
+has been processed. A client that wants to display the steps as they happen can
+send `Accept: text/event-stream` instead, and gets the same outcome delivered as
+server-sent events:
+
+```bash
+curl -N -H 'accept: text/event-stream' -H 'content-type: application/json' \
+  -d '{"config_repo": "https://github.com/example/config", "commit": "deadbeef"}' \
+  http://localhost:8080/v1/change
+```
+
+The stream carries four kinds of event:
+
+- `accepted` — sent immediately, with `config_repo`, `commit` and the `registered`
+  image version, so the client can render something before any git work starts.
+- `progress` — one per step, with a stable `phase` (`workspace`,
+  `source-checkout`, `deploy-config`, `manifests-checkout`, `generate`,
+  `generated`, `no-changes`, `commit`, `push`, `pushed`, `deployment-detection`),
+  a human readable `message`, and a `detail` object with specifics of the step.
+- `complete` — the same body the non-streaming response would have returned.
+- `error` — a change that failed, carrying the `status`, `error` and `message`
+  that the non-streaming response would have used.
+
+Comment lines (`: keep-alive`) are sent while a step is slow, so intermediate
+proxies do not treat the connection as dead.
+
+Because the HTTP status is committed before any manifest work begins, a streamed
+response is always `202` and processing failures arrive as a terminal `error`
+event. Everything that can be rejected up front — validation, authentication,
+the `system` role check, and image version registration — still fails with a
+regular status code and JSON body, whatever the client accepts.
+
+Disconnecting does not cancel a change in progress; the server finishes the work
+and logs the outcome.
+
 ## Development
 
 Run the test suite:

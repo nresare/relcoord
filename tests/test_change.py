@@ -13,6 +13,7 @@ from dulwich.errors import NotGitRepository
 from relcoord import change
 from relcoord.change import (
     ChangeProcessor,
+    ChangeProgress,
     CredentialError,
     DeployConfigError,
     DeploymentDetectionError,
@@ -158,6 +159,127 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         "change step 7/7: pushing manifests commit feedface to "
         "https://github.com/acme/manifests.git"
     ) in caplog.text
+
+
+def test_change_processor_reports_progress_for_each_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path,
+        manifests_checkout: Path,
+        *,
+        repo_root: Path,
+        create_commit: bool,
+        image: str | None,
+        namespace: str,
+        vars: dict[str, object],
+    ) -> GenerationResult:
+        return GenerationResult(
+            written_paths={manifests_checkout / "api.yaml"},
+            created_or_modified={
+                Ref(kind="Deployment", namespace="config", name="api")
+            },
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(
+        change, "_push_repository", lambda repo_path, remote, idcat: None
+    )
+
+    events: list[ChangeProgress] = []
+    ChangeProcessor("https://github.com/acme/manifests.git").process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        "registry.example.com/team/api:1.2.3",
+        progress=events.append,
+    )
+
+    assert [event.phase for event in events] == [
+        "workspace",
+        "source-checkout",
+        "deploy-config",
+        "manifests-checkout",
+        "generate",
+        "generated",
+        "commit",
+        "push",
+        "pushed",
+    ]
+    by_phase = {event.phase: event for event in events}
+    assert by_phase["source-checkout"].detail == {
+        "repo": "https://github.com/acme/config.git",
+        "commit": "deadbeef",
+    }
+    assert by_phase["source-checkout"].message == (
+        "checking out source repo https://github.com/acme/config.git at commit deadbeef"
+    )
+    assert by_phase["deploy-config"].detail["namespace"] == "config"
+    assert by_phase["deploy-config"].detail["system"] is False
+    assert by_phase["generated"].detail["generated"] == 1
+    assert by_phase["generated"].detail["paths"] == ["api.yaml"]
+    assert by_phase["push"].detail == {
+        "repository": "https://github.com/acme/manifests.git",
+        "manifest_commit": "feedface",
+    }
+
+
+def test_change_processor_reports_no_changes_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path,
+        manifests_checkout: Path,
+        *,
+        repo_root: Path,
+        create_commit: bool,
+        image: str | None,
+        namespace: str,
+        vars: dict[str, object],
+    ) -> GenerationResult:
+        return GenerationResult(
+            written_paths=set(),
+            created_or_modified=set(),
+            removed=set(),
+            deploy_id=None,
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+
+    events: list[ChangeProgress] = []
+    ChangeProcessor("https://github.com/acme/manifests.git").process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        progress=events.append,
+    )
+
+    assert [event.phase for event in events][-1] == "no-changes"
+    assert "nothing to commit or push" in events[-1].message
 
 
 def test_change_processor_generates_configured_outputs_with_vars(

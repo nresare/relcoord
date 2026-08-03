@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from time import perf_counter
@@ -13,15 +16,18 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from relcoord.auth import AuthError, TokenValidator, extract_bearer_token
 from relcoord.change import (
     ChangeProcessingError,
+    ChangeProgress,
     CredentialError,
     DeployConfigError,
     GitTransportError,
+    ProgressSink,
+    ignore_progress,
 )
 from relcoord.errors import (
     PersistenceUnavailableError,
@@ -34,6 +40,13 @@ from relcoord.store import ImageInfoStore
 
 logger = logging.getLogger(__name__)
 
+EVENT_STREAM_MEDIA_TYPE = "text/event-stream"
+
+# Idle event streams need traffic often enough that proxies between relcoord and
+# the client do not treat a long running step (a clone, a rollout) as a dead
+# connection.
+_HEARTBEAT_INTERVAL_SECONDS = 15.0
+
 
 class ChangeProcessor(Protocol):
     def process(
@@ -43,6 +56,8 @@ class ChangeProcessor(Protocol):
         image: str | None,
         config_path: str = ...,
         system: bool = ...,
+        *,
+        progress: ProgressSink = ...,
     ) -> object: ...
 
 
@@ -68,6 +83,22 @@ class NoopChangeResult:
     generated_count = 0
 
 
+@dataclass(frozen=True)
+class _ChangePlan:
+    """A validated change request, ready to hand to the change processor."""
+
+    repo: str
+    commit: str
+    config_path: str
+    system: bool
+    manifest_image: str | None
+    registered: dict[str, Any] | None = field(default=None)
+
+
+class _SystemNotAllowedError(Exception):
+    """Raised when a principal requests system mode without the role for it."""
+
+
 class NoopChangeProcessor:
     def process(
         self,
@@ -76,14 +107,16 @@ class NoopChangeProcessor:
         image: str | None,
         config_path: str = ".deploy",
         system: bool = False,
+        *,
+        progress: ProgressSink = ignore_progress,
     ) -> object:
-        logger.warning(
+        message = (
             "change processing disabled: no manifests_repository configured; "
             "skipping source checkout, manifest-builder invocation, manifests commit, "
-            "and push for repo %s at commit %s",
-            repo,
-            commit,
+            f"and push for repo {repo} at commit {commit}"
         )
+        logger.warning("%s", message)
+        progress(ChangeProgress(phase="disabled", message=message))
         return NoopChangeResult()
 
 
@@ -171,152 +204,126 @@ def create_app(
             status_code=status_code,
         )
 
+    async def _plan_change(request: Request, principal: object) -> _ChangePlan:
+        payload = await _read_json(request)
+        repo = ensure_string(
+            payload,
+            "config_repo",
+            error="invalid_config_repo",
+            message="config_repo must be a non-empty string",
+        )
+        repo = _normalize_change_repo(repo)
+        commit = ensure_string(payload, "commit")
+        system = _change_system_flag(payload)
+        if system and not _principal_allows_system(principal):
+            logger.warning(
+                "Rejected system-mode change for repo %s: role not permitted",
+                repo,
+            )
+            raise _SystemNotAllowedError
+        if system and "config_path" in payload:
+            raise ValidationError(
+                error="invalid_system_config_path",
+                message="config_path cannot be combined with system mode",
+            )
+        config_path = _change_config_path(payload)
+        image = (
+            ensure_string(
+                payload,
+                "image_repo",
+                error="invalid_image_repo",
+                message="image_repo must be a non-empty string",
+            )
+            if "image_repo" in payload
+            else None
+        )
+        tag = ensure_string(payload, "tag") if "tag" in payload else None
+        if (image is None) != (tag is None):
+            raise ValidationError(
+                error="invalid_image_repo_tag_pairing",
+                message="image_repo and tag must be provided together",
+            )
+        if system and image is not None:
+            raise ValidationError(
+                error="invalid_system_image",
+                message="image_repo and tag cannot be combined with system mode",
+            )
+
+        registered: dict[str, Any] | None = None
+        manifest_image = None
+        if image is not None and tag is not None:
+            result = await service.register_version(image=image, version=tag)
+            manifest_image = f"{image}:{tag}"
+            registered = {
+                "image": result.image,
+                "version": result.version,
+                "timestamp": _format_timestamp(result.timestamp),
+                "created": result.created,
+            }
+        return _ChangePlan(
+            repo=repo,
+            commit=commit,
+            config_path=config_path,
+            system=system,
+            manifest_image=manifest_image,
+            registered=registered,
+        )
+
     async def change(request: Request) -> Response:
         unauthorized, principal = _require_auth(request)
         if unauthorized is not None:
             return unauthorized
+        # Everything that can be rejected outright happens before any manifest
+        # work starts, so a streaming response only ever has to report failures
+        # that the change processor itself raises.
         try:
-            payload = await _read_json(request)
-            repo = ensure_string(
-                payload,
-                "config_repo",
-                error="invalid_config_repo",
-                message="config_repo must be a non-empty string",
-            )
-            repo = _normalize_change_repo(repo)
-            commit = ensure_string(payload, "commit")
-            system = _change_system_flag(payload)
-            if system and not _principal_allows_system(principal):
-                logger.warning(
-                    "Rejected system-mode change for repo %s: role not permitted",
-                    repo,
-                )
-                return _json_error(
-                    status_code=403,
-                    error="system_not_allowed",
-                    message="the authenticated role is not permitted to "
-                    "request system-mode changes",
-                )
-            if system and "config_path" in payload:
-                raise ValidationError(
-                    error="invalid_system_config_path",
-                    message="config_path cannot be combined with system mode",
-                )
-            config_path = _change_config_path(payload)
-            image = (
-                ensure_string(
-                    payload,
-                    "image_repo",
-                    error="invalid_image_repo",
-                    message="image_repo must be a non-empty string",
-                )
-                if "image_repo" in payload
-                else None
-            )
-            tag = ensure_string(payload, "tag") if "tag" in payload else None
-            if (image is None) != (tag is None):
-                raise ValidationError(
-                    error="invalid_image_repo_tag_pairing",
-                    message="image_repo and tag must be provided together",
-                )
-            if system and image is not None:
-                raise ValidationError(
-                    error="invalid_system_image",
-                    message="image_repo and tag cannot be combined with system mode",
-                )
-
-            registered: dict[str, Any] | None = None
-            manifest_image = None
-            if image is not None and tag is not None:
-                result = await service.register_version(image=image, version=tag)
-                manifest_image = f"{image}:{tag}"
-                registered = {
-                    "image": result.image,
-                    "version": result.version,
-                    "timestamp": _format_timestamp(result.timestamp),
-                    "created": result.created,
-                }
-            logger.info(
-                "Processing change for repo %s at commit %s with image %s",
-                repo,
-                commit,
-                manifest_image,
-            )
-            result = await asyncio.to_thread(
-                change_processor.process,
-                repo,
-                commit,
-                manifest_image,
-                config_path,
-                system,
-            )
-            processed = _change_result_payload(result)
-            logger.info(
-                "Processed change for repo %s at commit %s: generated %s manifest file(s)",
-                repo,
-                commit,
-                processed["generated"],
-            )
+            plan = await _plan_change(request, principal)
         except ValidationError as exc:
             return _bad_request(request, error=exc.error, message=exc.message)
+        except _SystemNotAllowedError:
+            return _json_error(
+                status_code=403,
+                error="system_not_allowed",
+                message="the authenticated role is not permitted to "
+                "request system-mode changes",
+            )
         except TimestampConflictError as exc:
             return _bad_request(
                 request,
                 error="timestamp_conflict",
                 message=str(exc),
             )
-        except DeployConfigError as exc:
-            return _bad_request(
-                request,
-                error="invalid_deploy_config",
-                message=str(exc),
-            )
-        except CredentialError as exc:
-            logger.warning(
-                "Insufficient git credentials to process change for repo %s "
-                "at commit %s: %s",
-                repo,
-                commit,
-                exc,
-            )
-            return _json_error(
-                status_code=502,
-                error="git_credentials_unavailable",
-                message=str(exc),
-            )
-        except GitTransportError as exc:
-            logger.warning(
-                "Git transport failure while processing change for repo %s "
-                "at commit %s: %s",
-                repo,
-                commit,
-                exc,
-            )
-            return _json_error(
-                status_code=502,
-                error="git_transport_failed",
-                message=str(exc),
-            )
         except PersistenceUnavailableError as exc:
             return _persistence_unavailable(request, exc)
-        except ChangeProcessingError as exc:
-            logger.exception(
-                "Failed to process change for repo %s at commit %s", repo, commit
-            )
-            return _json_error(
-                status_code=500,
-                error="change_processing_failed",
-                message=str(exc),
+
+        logger.info(
+            "Processing change for repo %s at commit %s with image %s",
+            plan.repo,
+            plan.commit,
+            plan.manifest_image,
+        )
+        if _wants_event_stream(request):
+            return StreamingResponse(
+                _change_events(request, plan, change_processor),
+                status_code=202,
+                media_type=EVENT_STREAM_MEDIA_TYPE,
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        logger.info("Accepted change for repo %s at commit %s", repo, commit)
-        body: dict[str, Any] = {
-            "config_repo": repo,
-            "commit": commit,
-            "registered": registered,
-        }
-        body["processed"] = processed
-        return JSONResponse(body, status_code=202)
+        try:
+            result = await asyncio.to_thread(
+                change_processor.process,
+                plan.repo,
+                plan.commit,
+                plan.manifest_image,
+                plan.config_path,
+                plan.system,
+            )
+        except ChangeProcessingError as exc:
+            status_code, error, message = _report_change_failure(request, plan, exc)
+            return _json_error(status_code=status_code, error=error, message=message)
+
+        return JSONResponse(_change_completion(plan, result), status_code=202)
 
     async def latest_versions(request: Request) -> Response:
         try:
@@ -426,7 +433,7 @@ def _json_error(status_code: int, error: str, message: str) -> JSONResponse:
     )
 
 
-def _bad_request(request: Request, *, error: str, message: str) -> JSONResponse:
+def _log_bad_request(request: Request, *, error: str, message: str) -> None:
     logger.warning(
         "Bad request %s %s: %s: %s",
         request.method,
@@ -434,6 +441,10 @@ def _bad_request(request: Request, *, error: str, message: str) -> JSONResponse:
         error,
         message,
     )
+
+
+def _bad_request(request: Request, *, error: str, message: str) -> JSONResponse:
+    _log_bad_request(request, error=error, message=message)
     return _json_error(status_code=400, error=error, message=message)
 
 
@@ -513,3 +524,178 @@ def _change_system_flag(payload: dict[str, Any]) -> bool:
 def _change_result_payload(result: object) -> dict[str, Any]:
     generated_count = getattr(result, "generated_count", None)
     return {"generated": generated_count}
+
+
+def _change_completion(plan: _ChangePlan, result: object) -> dict[str, Any]:
+    """Log a completed change and build the body describing it."""
+    processed = _change_result_payload(result)
+    logger.info(
+        "Processed change for repo %s at commit %s: generated %s manifest file(s)",
+        plan.repo,
+        plan.commit,
+        processed["generated"],
+    )
+    logger.info("Accepted change for repo %s at commit %s", plan.repo, plan.commit)
+    return {
+        "config_repo": plan.repo,
+        "commit": plan.commit,
+        "registered": plan.registered,
+        "processed": processed,
+    }
+
+
+def _report_change_failure(
+    request: Request, plan: _ChangePlan, exc: ChangeProcessingError
+) -> tuple[int, str, str]:
+    """Log a change processing failure and map it to a status code and error."""
+    if isinstance(exc, DeployConfigError):
+        _log_bad_request(request, error="invalid_deploy_config", message=str(exc))
+        return 400, "invalid_deploy_config", str(exc)
+    if isinstance(exc, CredentialError):
+        logger.warning(
+            "Insufficient git credentials to process change for repo %s "
+            "at commit %s: %s",
+            plan.repo,
+            plan.commit,
+            exc,
+        )
+        return 502, "git_credentials_unavailable", str(exc)
+    if isinstance(exc, GitTransportError):
+        logger.warning(
+            "Git transport failure while processing change for repo %s "
+            "at commit %s: %s",
+            plan.repo,
+            plan.commit,
+            exc,
+        )
+        return 502, "git_transport_failed", str(exc)
+    logger.error(
+        "Failed to process change for repo %s at commit %s",
+        plan.repo,
+        plan.commit,
+        exc_info=exc,
+    )
+    return 500, "change_processing_failed", str(exc)
+
+
+def _wants_event_stream(request: Request) -> bool:
+    """Report whether the client explicitly asked for an SSE response.
+
+    A wildcard ``Accept`` does not count: clients have to opt in, so that the
+    existing single JSON response stays the default.
+    """
+    for entry in request.headers.get("accept", "").split(","):
+        media_type = entry.split(";", maxsplit=1)[0].strip().lower()
+        if media_type == EVENT_STREAM_MEDIA_TYPE:
+            return True
+    return False
+
+
+def _sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _change_events(
+    request: Request, plan: _ChangePlan, change_processor: ChangeProcessor
+) -> AsyncIterator[str]:
+    """Stream the change processor's steps as server-sent events.
+
+    The processor is synchronous and runs in a worker thread, so its progress
+    callback hops back onto the event loop through a queue. A client that goes
+    away does not cancel the change: a half pushed manifests repository is worse
+    than an unobserved one.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[ChangeProgress | None] = asyncio.Queue()
+
+    def sink(event: ChangeProgress) -> None:
+        # Called on the worker thread running the change processor.
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    async def run() -> object:
+        try:
+            return await asyncio.to_thread(
+                change_processor.process,
+                plan.repo,
+                plan.commit,
+                plan.manifest_image,
+                plan.config_path,
+                plan.system,
+                progress=sink,
+            )
+        finally:
+            # asyncio runs the callbacks scheduled by sink() before the one that
+            # resolves the to_thread future, so every progress event is already
+            # queued by the time this sentinel lands behind them.
+            queue.put_nowait(None)
+
+    task = asyncio.create_task(run())
+    outcome_reported = False
+    try:
+        yield _sse_event(
+            "accepted",
+            {
+                "config_repo": plan.repo,
+                "commit": plan.commit,
+                "registered": plan.registered,
+            },
+        )
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), _HEARTBEAT_INTERVAL_SECONDS)
+            except TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+            if event is None:
+                break
+            yield _sse_event(
+                "progress",
+                {
+                    "phase": event.phase,
+                    "message": event.message,
+                    "detail": event.detail,
+                },
+            )
+
+        try:
+            result = await task
+        except ChangeProcessingError as exc:
+            outcome_reported = True
+            status_code, error, message = _report_change_failure(request, plan, exc)
+            yield _sse_event(
+                "error",
+                {"status": status_code, "error": error, "message": message},
+            )
+            return
+        outcome_reported = True
+        yield _sse_event("complete", _change_completion(plan, result))
+    finally:
+        if not outcome_reported:
+            # The stream was closed before the change finished, most likely
+            # because the client disconnected. Report the outcome to the log
+            # instead, and retrieve any exception so asyncio does not warn.
+            task.add_done_callback(_log_unobserved_change(plan))
+
+
+def _log_unobserved_change(plan: _ChangePlan) -> Callable[[asyncio.Task[object]], None]:
+    def log_outcome(task: asyncio.Task[object]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            logger.info(
+                "Change for repo %s at commit %s completed after its event "
+                "stream was closed",
+                plan.repo,
+                plan.commit,
+            )
+            return
+        logger.warning(
+            "Change for repo %s at commit %s failed after its event stream "
+            "was closed: %s",
+            plan.repo,
+            plan.commit,
+            exc,
+        )
+
+    return log_outcome
