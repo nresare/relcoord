@@ -5,6 +5,12 @@ port = 8080
 log-level = "INFO"
 detect-deployment = false
 
+# The output that /v1/diffcomment reports on, named after one of the [[output]]
+# entries below. Only that output is generated for a diff, so a pull request
+# comment shows one cluster's manifests rather than every cluster at once.
+# Defaults to all configured outputs.
+diff-output = "example-dev"
+
 [[output]]
 name = "example-dev"
 repository = "https://github.com/example/manifests"
@@ -49,9 +55,10 @@ github-app = "deployments"
 token-path = "/tmp/idcat-bearer-token"
 
 # Bearer-token authentication for write endpoints. Each [[role]] entry
-# describes one acceptable JWT issuer. A request to /v1/image-versions or
-# /v1/change must present a Bearer token that validates against at least one
-# role. Read endpoints (/healthz, /v1/images/latest) are not authenticated.
+# describes one acceptable JWT issuer. A request to /v1/image-versions,
+# /v1/change or /v1/diffcomment must present a Bearer token that validates
+# against at least one role. Read endpoints (/healthz, /v1/images/latest) are
+# not authenticated.
 
 [[role]]
 name = "kubernetes-default"
@@ -59,9 +66,9 @@ audience = "relcoord"
 issuer = "https://kubernetes.default.svc"
 jwks-uri = "https://kubernetes.default.svc/openid/v1/jwks"
 
-# Set allow_system = true to permit this role to make system-mode change
-# requests (payloads with "system": true), which read config from the
-# repository root and generate manifests as the 'system' owner across all
+# Set allow_system = true to permit this role to make system-mode change or
+# diffcomment requests (payloads with "system": true), which read config from
+# the repository root and generate manifests as the 'system' owner across all
 # namespaces and cluster-scoped directories. Defaults to false.
 allow_system = false
 

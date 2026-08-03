@@ -230,6 +230,97 @@ def test_settings_defaults_output_directory_to_repository_root(
     assert settings.outputs[0].directory == Path(".")
 
 
+def test_settings_defaults_diff_output_to_every_output(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+        """
+    )
+
+    assert Settings.from_toml(config).diff_output is None
+
+
+def test_settings_parses_diff_output(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        diff-output = "example-dev"
+
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+        directory = "example-dev"
+
+        [[output]]
+        name = "example-prod"
+        repository = "https://github.com/example/manifests"
+        directory = "example-prod"
+        """
+    )
+
+    assert Settings.from_toml(config).diff_output == "example-dev"
+
+
+def test_settings_rejects_diff_output_that_names_no_output(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        diff-output = "example-staging"
+
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+
+        [[output]]
+        name = "example-prod"
+        repository = "https://github.com/example/manifests"
+        """
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "diff-output 'example-staging' does not name a configured output; "
+            "expected one of example-dev, example-prod"
+        ),
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_diff_output_without_outputs(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        manifests-repository = "https://github.com/acme/manifests.git"
+        diff-output = "manifests"
+        """
+    )
+
+    with pytest.raises(
+        ValueError, match=r"diff-output requires \[\[output\]\] entries"
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_empty_diff_output(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        diff-output = ""
+
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+        """
+    )
+
+    with pytest.raises(ValueError, match="diff-output must be a non-empty string"):
+        Settings.from_toml(config)
+
+
 def test_settings_rejects_output_with_non_scalar_vars(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(

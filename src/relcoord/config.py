@@ -162,6 +162,7 @@ class Settings:
     log_level: str = "INFO"
     manifests_repository: str | None = None
     outputs: list[OutputSettings] = field(default_factory=list)
+    diff_output: str | None = None
     detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
     idcat: IdcatSettings | None = None
@@ -197,6 +198,7 @@ class Settings:
             raise ValueError(
                 "configure either manifests-repository or [[output]], not both"
             )
+        diff_output = _diff_output(data, outputs)
         roles: list[RoleConfig] = []
         seen: set[str] = set()
         for entry in raw_roles:
@@ -218,6 +220,7 @@ class Settings:
             log_level=_log_level_or_default(data, "log-level", cls.log_level),
             manifests_repository=manifests_repository,
             outputs=outputs,
+            diff_output=diff_output,
             detect_deployment=_bool_or_default(
                 data,
                 "detect-deployment",
@@ -273,6 +276,26 @@ def _optional_persistence_string(data: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"persistence.{key} must be a non-empty string")
     return value
+
+
+def _diff_output(data: dict[str, Any], outputs: list[OutputSettings]) -> str | None:
+    """Read the name of the output that /v1/diffcomment reports on.
+
+    A diff covering several clusters is not what a reviewer wants to read, so a
+    deployment with more than one output picks the one worth commenting on.
+    """
+    name = _optional_string(data, "diff-output")
+    if name is None:
+        return None
+    if not outputs:
+        raise ValueError("diff-output requires [[output]] entries")
+    configured = {output.name for output in outputs}
+    if name not in configured:
+        raise ValueError(
+            f"diff-output '{name}' does not name a configured output; "
+            f"expected one of {', '.join(sorted(configured))}"
+        )
+    return name
 
 
 def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:

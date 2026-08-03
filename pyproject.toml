@@ -18,6 +18,7 @@ dependencies = [
   "hypercorn",
   "manifest-builder",
   "pyjwt[crypto]",
+  "pyyaml",
   "starlette",
   "surrealdb",
 ]

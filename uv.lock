@@ -800,6 +800,7 @@ dependencies = [
     { name = "hypercorn" },
     { name = "manifest-builder" },
     { name = "pyjwt", extra = ["crypto"] },
+    { name = "pyyaml" },
     { name = "starlette" },
     { name = "surrealdb" },
 ]
@@ -823,6 +824,7 @@ requires-dist = [
     { name = "hypercorn" },
     { name = "manifest-builder" },
     { name = "pyjwt", extras = ["crypto"] },
+    { name = "pyyaml" },
     { name = "starlette" },
     { name = "surrealdb" },
 ]

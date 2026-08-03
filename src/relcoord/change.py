@@ -13,14 +13,26 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from dulwich import porcelain
+from dulwich.objects import Commit, ObjectID
 from dulwich.repo import Repo
 from manifest_builder import GenerationResult, generate
 
 from relcoord.config import IdcatSettings, OutputSettings, TemplateValue
 from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
+from relcoord.github import GithubCommentError, GithubIssueCommenter, IssueCommenter
 from relcoord.kubernetes import KubernetesDeploymentDetector
+from relcoord.manifest_diff import (
+    DiffSection,
+    ManifestDiff,
+    build_comment_body,
+    manifest_diff,
+)
 
 logger = logging.getLogger(__name__)
+
+# relcoord has nowhere to upload an artifact to, so the full diff travels back
+# with the response that asked for the comment.
+FULL_DIFF_REFERENCE = "returned in the relcoord response for this request"
 
 
 class ChangeProcessingError(Exception):
@@ -52,6 +64,15 @@ class GitTransportError(ChangeProcessingError):
 
 class DeploymentDetectionError(ChangeProcessingError):
     pass
+
+
+class CommentPostError(ChangeProcessingError):
+    """Raised when a manifest diff comment could not be posted to GitHub.
+
+    The diff itself succeeded in this case, so the failure is about GitHub
+    rejecting the comment rather than about the manifests, and is reported
+    without a stack trace.
+    """
 
 
 class DeploymentDetector(Protocol):
@@ -144,21 +165,9 @@ class ChangeProcessor:
             logger.info("change step 2/7: %s", message)
             report("source-checkout", message, repo=repo, commit=commit)
             _checkout_commit(repo, commit, source_checkout, self.idcat)
-            if system:
-                # System mode: config lives at the repository root and
-                # manifest-builder runs as the 'system' owner (namespace=None),
-                # generating into every namespace not claimed by another owner
-                # as well as cluster-scoped directories.
-                deploy_config = source_checkout
-                namespace = None
-            else:
-                deploy_config = source_checkout / config_path
-                namespace = _namespace_from_repo(repo)
-                if not deploy_config.is_dir():
-                    raise DeployConfigError(
-                        f"commit {commit} in {repo} does not contain "
-                        f"a {config_path} directory"
-                    )
+            deploy_config, namespace = _deploy_config_and_namespace(
+                source_checkout, repo, commit, config_path, system
+            )
             message = f"found deploy config at {deploy_config} (system mode: {system})"
             logger.info("change step 3/7: %s", message)
             report(
@@ -334,17 +343,357 @@ class ChangeProcessor:
             shutil.rmtree(workdir, ignore_errors=True)
 
     def _configured_outputs(self) -> tuple[OutputSettings, ...]:
-        if self.outputs:
-            return tuple(self.outputs)
-        if self.manifests_repository is None:
-            raise ChangeProcessingError("at least one output must be configured")
-        return (
-            OutputSettings(
-                name="manifests",
-                repository=self.manifests_repository,
-                directory=Path("."),
-            ),
+        return _resolve_output_settings(self.outputs, self.manifests_repository)
+
+
+@dataclass(frozen=True)
+class OutputDiff:
+    """What one configured output contributed to a manifest diff."""
+
+    name: str
+    repository: str
+    directory: Path
+    generated_count: int
+
+
+@dataclass(frozen=True)
+class RepositoryDiff:
+    repository: str
+    manifest_diff: ManifestDiff
+
+
+@dataclass(frozen=True)
+class DiffComment:
+    body: str
+    posted: bool
+    url: str | None = None
+
+
+@dataclass(frozen=True)
+class DiffResult:
+    repo: str
+    commit: str
+    pull_request: int | None
+    generated_count: int
+    outputs: tuple[OutputDiff, ...]
+    diffs: tuple[RepositoryDiff, ...]
+    comment: DiffComment
+
+
+@dataclass(frozen=True)
+class DiffCommentProcessor:
+    """Reports what a config commit would do to the manifests repositories.
+
+    The work is the same as :class:`ChangeProcessor` up to and including the
+    manifest commit, and then stops: nothing is pushed. The commit is still made,
+    in the throwaway checkout, because that is what makes the diff the one a
+    change would produce, cleanups and deploy-id annotations included.
+
+    ``diff_output`` names the single output to report on, for a deployment where
+    a diff across every configured output would be more than a reviewer wants to
+    read. Every configured output is reported when it is unset.
+    """
+
+    manifests_repository: str | None = None
+    outputs: Sequence[OutputSettings] = ()
+    diff_output: str | None = None
+    idcat: IdcatSettings | None = None
+    commenter: IssueCommenter | None = None
+
+    def diff(
+        self,
+        repo: str,
+        commit: str,
+        config_path: str = ".deploy",
+        system: bool = False,
+        *,
+        pull_request: int | None = None,
+        progress: ProgressSink = ignore_progress,
+    ) -> DiffResult:
+        def report(phase: str, message: str, **detail: Any) -> None:
+            progress(ChangeProgress(phase=phase, message=message, detail=detail))
+
+        workdir = Path(tempfile.mkdtemp(prefix="relcoord-diff-"))
+        try:
+            source_checkout = workdir / "source"
+            output_settings = _selected_outputs(
+                _resolve_output_settings(self.outputs, self.manifests_repository),
+                self.diff_output,
+            )
+            checkout_by_repository = _checkout_paths_by_repository(
+                workdir, output_settings
+            )
+            message = (
+                f"created temporary workspace {workdir} for repo {repo} "
+                f"at commit {commit}"
+            )
+            logger.info("diff step 1/6: %s", message)
+            report("workspace", message, workdir=str(workdir))
+            message = f"checking out source repo {repo} at commit {commit}"
+            logger.info("diff step 2/6: %s", message)
+            report("source-checkout", message, repo=repo, commit=commit)
+            _checkout_commit(repo, commit, source_checkout, self.idcat)
+            deploy_config, namespace = _deploy_config_and_namespace(
+                source_checkout, repo, commit, config_path, system
+            )
+            message = f"found deploy config at {deploy_config} (system mode: {system})"
+            logger.info("diff step 3/6: %s", message)
+            report(
+                "deploy-config",
+                message,
+                deploy_config=str(deploy_config),
+                system=system,
+                namespace=namespace,
+            )
+
+            output_diffs: list[OutputDiff] = []
+            repository_diffs: list[RepositoryDiff] = []
+            total_generated = 0
+
+            for repository, manifests_checkout in checkout_by_repository.items():
+                message = f"checking out manifests repo {repository} into {manifests_checkout}"
+                logger.info("diff step 4/6: %s", message)
+                report("manifests-checkout", message, repository=repository)
+                _clone_repository(
+                    repository,
+                    manifests_checkout,
+                    self.idcat,
+                    purpose=f"cloning manifests repo {repository}",
+                    depth="1",
+                )
+                base_commit = _head_commit(manifests_checkout)
+
+                for output in _outputs_for_repository(output_settings, repository):
+                    output_path = manifests_checkout / output.directory
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    logger.info(
+                        "diff step 5/6: invoking manifest-builder generate("
+                        "output=%s, deploy_config=%s, manifests_checkout=%s, "
+                        "namespace=%s, vars=%s)",
+                        output.name,
+                        deploy_config,
+                        output_path,
+                        namespace,
+                        _vars_log_summary(output.vars),
+                    )
+                    report(
+                        "generate",
+                        f"invoking manifest-builder for output {output.name}",
+                        output=output.name,
+                        repository=repository,
+                        directory=str(output.directory),
+                    )
+                    generation_result = generate(
+                        deploy_config,
+                        output_path,
+                        repo_root=Path("/"),
+                        create_commit=True,
+                        image=None,
+                        namespace=namespace,
+                        vars=output.vars,
+                    )
+                    generated = _written_paths(generation_result)
+                    message = (
+                        f"manifest-builder generated {len(generated)} file(s) "
+                        f"for output {output.name}"
+                    )
+                    logger.info("diff step 5/6: %s", message)
+                    report(
+                        "generated",
+                        message,
+                        output=output.name,
+                        repository=repository,
+                        generated=len(generated),
+                    )
+                    output_diffs.append(
+                        OutputDiff(
+                            name=output.name,
+                            repository=output.repository,
+                            directory=output.directory,
+                            generated_count=len(generated),
+                        )
+                    )
+                    total_generated += len(generated)
+
+                repository_diff = _manifests_diff(manifests_checkout, base_commit)
+                repository_diffs.append(
+                    RepositoryDiff(repository=repository, manifest_diff=repository_diff)
+                )
+                if repository_diff.diff.strip():
+                    changed_files = _changed_file_count(repository_diff)
+                    message = (
+                        f"manifest-builder changed {changed_files} file(s) "
+                        f"in repo {repository}"
+                    )
+                    logger.info("diff step 6/6: %s", message)
+                    report(
+                        "diff",
+                        message,
+                        repository=repository,
+                        changed=changed_files,
+                    )
+                else:
+                    message = (
+                        f"manifest-builder produced no changes for repo {repository}"
+                    )
+                    logger.info("diff step 6/6: %s", message)
+                    report("no-changes", message, repository=repository)
+
+            comment_body = build_comment_body(
+                _diff_sections(repository_diffs),
+                full_diff_reference=FULL_DIFF_REFERENCE,
+            )
+            comment = self._comment(repo, pull_request, comment_body.body, report)
+            return DiffResult(
+                repo=repo,
+                commit=commit,
+                pull_request=pull_request,
+                generated_count=total_generated,
+                outputs=tuple(output_diffs),
+                diffs=tuple(repository_diffs),
+                comment=comment,
+            )
+        except ChangeProcessingError:
+            raise
+        except Exception as exc:
+            raise ChangeProcessingError(str(exc)) from exc
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def _comment(
+        self,
+        repo: str,
+        pull_request: int | None,
+        body: str,
+        report: Callable[..., None],
+    ) -> DiffComment:
+        if pull_request is None:
+            message = (
+                "no pull request requested; not posting a manifest diff comment "
+                f"for repo {repo}"
+            )
+            logger.info("diff complete: %s", message)
+            report("no-comment", message, repo=repo)
+            return DiffComment(body=body, posted=False)
+
+        commenter = (
+            self.commenter
+            if self.commenter is not None
+            else GithubIssueCommenter(idcat=self.idcat)
         )
+        message = (
+            f"posting manifest diff comment to {repo} pull request #{pull_request}"
+        )
+        logger.info("diff step 6/6: %s", message)
+        report("comment", message, repo=repo, pull_request=pull_request)
+        try:
+            url = commenter.post_comment(repo, pull_request, body)
+        except GitCredentialError as exc:
+            raise CredentialError(
+                "failed to obtain git credentials while posting a manifest diff "
+                f"comment to {repo} pull request #{pull_request}: {exc}"
+            ) from exc
+        except GithubCommentError as exc:
+            raise CommentPostError(str(exc)) from exc
+
+        message = f"posted manifest diff comment to {repo} pull request #{pull_request}"
+        logger.info("diff complete: %s", message)
+        report(
+            "commented",
+            message,
+            repo=repo,
+            pull_request=pull_request,
+            url=url,
+        )
+        return DiffComment(body=body, posted=True, url=url)
+
+
+def _resolve_output_settings(
+    outputs: Sequence[OutputSettings], manifests_repository: str | None
+) -> tuple[OutputSettings, ...]:
+    if outputs:
+        return tuple(outputs)
+    if manifests_repository is None:
+        raise ChangeProcessingError("at least one output must be configured")
+    return (
+        OutputSettings(
+            name="manifests",
+            repository=manifests_repository,
+            directory=Path("."),
+        ),
+    )
+
+
+def _selected_outputs(
+    outputs: tuple[OutputSettings, ...], name: str | None
+) -> tuple[OutputSettings, ...]:
+    """Narrow the configured outputs to the one a diff was configured to report."""
+    if name is None:
+        return outputs
+    selected = tuple(output for output in outputs if output.name == name)
+    if not selected:
+        raise ChangeProcessingError(
+            f"diff-output '{name}' does not name a configured output"
+        )
+    logger.info("reporting the manifest diff for output %s only", name)
+    return selected
+
+
+def _deploy_config_and_namespace(
+    source_checkout: Path, repo: str, commit: str, config_path: str, system: bool
+) -> tuple[Path, str | None]:
+    if system:
+        # System mode: config lives at the repository root and manifest-builder
+        # runs as the 'system' owner (namespace=None), generating into every
+        # namespace not claimed by another owner as well as cluster-scoped
+        # directories.
+        return source_checkout, None
+
+    deploy_config = source_checkout / config_path
+    if not deploy_config.is_dir():
+        raise DeployConfigError(
+            f"commit {commit} in {repo} does not contain a {config_path} directory"
+        )
+    return deploy_config, _namespace_from_repo(repo)
+
+
+def _manifests_diff(manifests_checkout: Path, base_commit: str) -> ManifestDiff:
+    """Diff what manifest-builder committed against the cloned commit.
+
+    manifest-builder creates no commit when it changed nothing, in which case
+    both sides of the diff are the commit the checkout was cloned at.
+    """
+    repo = Repo(manifests_checkout)
+    try:
+        base = _commit_tree(repo, ObjectID(base_commit.encode("ascii")))
+        return manifest_diff(repo, base, _commit_tree(repo, repo.head()))
+    finally:
+        repo.close()
+
+
+def _commit_tree(repo: Repo, commit: ObjectID) -> ObjectID:
+    obj = repo.object_store[commit]
+    if not isinstance(obj, Commit):
+        raise ChangeProcessingError(f"{commit.decode()} is not a commit")
+    return ObjectID(obj.tree)
+
+
+def _changed_file_count(diff: ManifestDiff) -> int:
+    return sum(1 for line in diff.diff.splitlines() if line.startswith("diff --git "))
+
+
+def _diff_sections(diffs: Sequence[RepositoryDiff]) -> tuple[DiffSection, ...]:
+    """Pair each repository's diff with the heading to render it under.
+
+    A single manifests repository, which is the usual configuration, renders
+    without a heading.
+    """
+    if len(diffs) == 1:
+        return (DiffSection(heading=None, diff=diffs[0].manifest_diff),)
+    return tuple(
+        DiffSection(heading=entry.repository, diff=entry.manifest_diff)
+        for entry in diffs
+    )
 
 
 def _written_paths(generation_result: object) -> set[Path]:

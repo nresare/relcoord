@@ -17,8 +17,10 @@ from relcoord.app import (
 )
 from relcoord.auth import TokenValidator
 from relcoord.change import ChangeProcessor as ManifestChangeProcessor
+from relcoord.change import DiffCommentProcessor
 from relcoord.config import Settings
 from relcoord.dynamodb_store import DynamoDBImageInfoStore
+from relcoord.github import GithubIssueCommenter
 from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.retrying_store import RetryingImageInfoStore
 from relcoord.store import ImageInfoStore
@@ -35,6 +37,7 @@ async def run(settings: Settings, disable_auth: bool) -> None:
     config.bind = [f"{settings.listen}:{settings.port}"]
     token_validator = _build_token_validator(settings, disable_auth)
     change_processor = make_change_processor(settings)
+    diff_processor = make_diff_processor(settings)
     store = await make_store(settings)
     try:
         # This has been raised upstream: https://github.com/pgjones/hypercorn/issues/353
@@ -43,6 +46,7 @@ async def run(settings: Settings, disable_auth: bool) -> None:
             store,
             token_validator=token_validator,
             change_processor=change_processor,
+            diff_processor=diff_processor,
         )
         await serve(app, config)  # ty: ignore[invalid-argument-type]
     finally:
@@ -88,6 +92,16 @@ def make_change_processor(
         outputs=settings.outputs,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
+    )
+
+
+def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
+    return DiffCommentProcessor(
+        manifests_repository=settings.manifests_repository,
+        outputs=settings.outputs,
+        diff_output=settings.diff_output,
+        idcat=settings.idcat,
+        commenter=GithubIssueCommenter(idcat=settings.idcat),
     )
 
 

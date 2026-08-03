@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable, MutableMapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -20,7 +21,9 @@ from relcoord.app import (
     create_app,
 )
 from relcoord.change import (
+    ChangeProcessingError,
     ChangeProgress,
+    CommentPostError,
     CredentialError,
     DeployConfigError,
     GitTransportError,
@@ -1406,3 +1409,452 @@ def test_change_negotiates_event_stream_on_accept_header(
     assert response.status_code == 202
     is_stream = response.headers["content-type"].startswith("text/event-stream")
     assert is_stream is streams
+
+
+@dataclass(frozen=True)
+class _StubManifestDiff:
+    stat: str
+    diff: str
+    summary: str = ""
+
+
+@dataclass(frozen=True)
+class _StubRepositoryDiff:
+    repository: str
+    manifest_diff: _StubManifestDiff
+
+
+@dataclass(frozen=True)
+class _StubOutputDiff:
+    name: str
+    repository: str
+    directory: str
+    generated_count: int
+
+
+@dataclass(frozen=True)
+class _StubComment:
+    body: str
+    posted: bool
+    url: str | None = None
+
+
+@dataclass(frozen=True)
+class _StubDiffResult:
+    generated_count: int
+    outputs: tuple[_StubOutputDiff, ...]
+    diffs: tuple[_StubRepositoryDiff, ...]
+    comment: _StubComment
+
+
+def _stub_diff_result() -> _StubDiffResult:
+    return _StubDiffResult(
+        generated_count=2,
+        outputs=(
+            _StubOutputDiff(
+                name="example-dev",
+                repository="https://github.com/acme/manifests",
+                directory="example-dev",
+                generated_count=2,
+            ),
+        ),
+        diffs=(
+            _StubRepositoryDiff(
+                repository="https://github.com/acme/manifests",
+                manifest_diff=_StubManifestDiff(
+                    stat=" api.yaml | 2 +-\n",
+                    diff="diff --git a/api.yaml b/api.yaml\n-old\n+new\n",
+                    summary="- Label `version` changed from `1` to `2` on 2 manifests.",
+                ),
+            ),
+        ),
+        comment=_StubComment(
+            body="the comment body",
+            posted=True,
+            url="https://github.com/acme/config/pull/7#issuecomment-1",
+        ),
+    )
+
+
+class _RecordingDiffProcessor:
+    """A diff processor that records its calls and reports canned progress."""
+
+    def __init__(
+        self,
+        steps: list[ChangeProgress] | None = None,
+        failure: Exception | None = None,
+        result: object | None = None,
+    ) -> None:
+        self.calls: list[tuple[str, str, str, bool, int | None]] = []
+        self._steps = steps or []
+        self._failure = failure
+        self._result = result if result is not None else _stub_diff_result()
+
+    def diff(
+        self,
+        repo: str,
+        commit: str,
+        config_path: str = ".deploy",
+        system: bool = False,
+        *,
+        pull_request: int | None = None,
+        progress: ProgressSink = ignore_progress,
+    ) -> object:
+        self.calls.append((repo, commit, config_path, system, pull_request))
+        for step in self._steps:
+            progress(step)
+        if self._failure is not None:
+            raise self._failure
+        return self._result
+
+
+def _diff_client(
+    processor: _RecordingDiffProcessor | None = None,
+    token_validator: RequestTokenValidator | None = None,
+) -> tuple[TestClient, _RecordingDiffProcessor]:
+    diff_processor = processor if processor is not None else _RecordingDiffProcessor()
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=(
+                token_validator if token_validator is not None else NoopTokenValidator()
+            ),
+            change_processor=NoopChangeProcessor(),
+            diff_processor=diff_processor,
+        )
+    )
+    return client, diff_processor
+
+
+def test_diffcomment_returns_the_diff_and_the_posted_comment() -> None:
+    client, processor = _diff_client()
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "pull_request": 7,
+            "system": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert processor.calls == [
+        ("https://github.com/acme/config", "deadbeef", ".deploy", True, 7)
+    ]
+    body = response.json()
+    assert body["config_repo"] == "https://github.com/acme/config"
+    assert body["commit"] == "deadbeef"
+    assert body["pull_request"] == 7
+    assert body["generated"] == 2
+    assert body["outputs"] == [
+        {
+            "name": "example-dev",
+            "repository": "https://github.com/acme/manifests",
+            "directory": "example-dev",
+            "generated": 2,
+        }
+    ]
+    assert body["diffs"] == [
+        {
+            "repository": "https://github.com/acme/manifests",
+            "stat": " api.yaml | 2 +-\n",
+            "summary": "- Label `version` changed from `1` to `2` on 2 manifests.",
+            "diff": "diff --git a/api.yaml b/api.yaml\n-old\n+new\n",
+        }
+    ]
+    assert body["comment"] == {
+        "posted": True,
+        "url": "https://github.com/acme/config/pull/7#issuecomment-1",
+        "body": "the comment body",
+    }
+
+
+def test_diffcomment_without_a_pull_request_does_not_ask_for_a_comment() -> None:
+    client, processor = _diff_client()
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={"config_repo": "https://github.com/acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 200
+    assert processor.calls == [
+        ("https://github.com/acme/config", "deadbeef", ".deploy", False, None)
+    ]
+    assert response.json()["pull_request"] is None
+
+
+def test_diffcomment_passes_a_custom_config_path() -> None:
+    client, processor = _diff_client()
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "config_path": "deploy/dev",
+        },
+    )
+
+    assert response.status_code == 200
+    assert processor.calls[0][2] == "deploy/dev"
+
+
+def test_diffcomment_converts_github_ssh_style_repo_uri() -> None:
+    client, processor = _diff_client()
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={"config_repo": "git@github.com:acme/config.git", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 200
+    assert processor.calls[0][0] == "https://github.com/acme/config.git"
+
+
+@pytest.mark.parametrize(
+    ("json", "error"),
+    [
+        ({"commit": "deadbeef"}, "invalid_config_repo"),
+        ({"config_repo": "https://github.com/acme/config"}, "invalid_commit"),
+        (
+            {
+                "config_repo": "https://github.com/acme/config",
+                "commit": "deadbeef",
+                "pull_request": "7",
+            },
+            "invalid_pull_request",
+        ),
+        (
+            {
+                "config_repo": "https://github.com/acme/config",
+                "commit": "deadbeef",
+                "pull_request": 0,
+            },
+            "invalid_pull_request",
+        ),
+        (
+            {
+                "config_repo": "https://github.com/acme/config",
+                "commit": "deadbeef",
+                "pull_request": True,
+            },
+            "invalid_pull_request",
+        ),
+        (
+            {
+                "config_repo": "https://github.com/acme/config",
+                "commit": "deadbeef",
+                "system": True,
+                "config_path": "deploy",
+            },
+            "invalid_system_config_path",
+        ),
+        (
+            {
+                "config_repo": "https://github.com/acme/config",
+                "commit": "deadbeef",
+                "image_repo": "registry.example.com/team/api",
+                "tag": "1.2.3",
+            },
+            "invalid_diff_image",
+        ),
+        (
+            {
+                "config_repo": "https://git.example.com/acme/config",
+                "commit": "deadbeef",
+                "pull_request": 7,
+            },
+            "unsupported_comment_repo",
+        ),
+    ],
+)
+def test_diffcomment_rejects_invalid_requests(
+    json: dict[str, object], error: str
+) -> None:
+    client, processor = _diff_client()
+
+    response = client.post("/v1/diffcomment", json=json)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == error
+    assert processor.calls == []
+
+
+def test_diffcomment_rejects_system_mode_without_the_role() -> None:
+    client, processor = _diff_client(token_validator=_StubValidator(allow_system=False))
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "system": True,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "system_not_allowed"
+    assert processor.calls == []
+
+
+def test_diffcomment_reports_when_no_diff_processor_is_configured() -> None:
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=NoopChangeProcessor(),
+        )
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={"config_repo": "https://github.com/acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 501
+    assert response.json()["error"] == "diffcomment_unavailable"
+
+
+def test_diffcomment_reports_a_missing_deploy_config() -> None:
+    client, _processor = _diff_client(
+        _RecordingDiffProcessor(failure=DeployConfigError("no .deploy directory"))
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={"config_repo": "https://github.com/acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "invalid_deploy_config",
+        "message": "no .deploy directory",
+    }
+
+
+def test_diffcomment_reports_a_rejected_comment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, _processor = _diff_client(
+        _RecordingDiffProcessor(failure=CommentPostError("GitHub returned HTTP 403"))
+    )
+
+    with caplog.at_level(logging.WARNING, logger="relcoord.app"):
+        response = client.post(
+            "/v1/diffcomment",
+            json={
+                "config_repo": "https://github.com/acme/config",
+                "commit": "deadbeef",
+                "pull_request": 7,
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "comment_post_failed"
+    assert "Failed to post a manifest diff comment" in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
+
+
+def test_diffcomment_reports_a_git_transport_failure() -> None:
+    client, _processor = _diff_client(
+        _RecordingDiffProcessor(failure=GitTransportError("dulwich clone failed"))
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={"config_repo": "https://github.com/acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "git_transport_failed"
+
+
+def test_diffcomment_reports_an_unexpected_failure() -> None:
+    client, _processor = _diff_client(
+        _RecordingDiffProcessor(failure=ChangeProcessingError("boom"))
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={"config_repo": "https://github.com/acme/config", "commit": "deadbeef"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "diff_processing_failed"
+
+
+def test_diffcomment_streams_progress_when_client_accepts_event_stream() -> None:
+    client, _processor = _diff_client(
+        _RecordingDiffProcessor(
+            steps=[
+                ChangeProgress(
+                    phase="manifests-checkout",
+                    message="checking out manifests repo",
+                    detail={"repository": "https://github.com/acme/manifests"},
+                ),
+                ChangeProgress(
+                    phase="commented",
+                    message="posted manifest diff comment",
+                    detail={"pull_request": 7},
+                ),
+            ]
+        )
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "pull_request": 7,
+        },
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == [
+        "accepted",
+        "progress",
+        "progress",
+        "complete",
+    ]
+    assert events[0][1] == {
+        "config_repo": "https://github.com/acme/config",
+        "commit": "deadbeef",
+        "pull_request": 7,
+    }
+    assert events[1][1]["phase"] == "manifests-checkout"
+    complete = events[3][1]
+    assert complete["comment"]["posted"] is True
+    assert complete["diffs"][0]["repository"] == "https://github.com/acme/manifests"
+
+
+def test_diffcomment_streams_a_terminal_error_event_when_processing_fails() -> None:
+    client, _processor = _diff_client(
+        _RecordingDiffProcessor(failure=CommentPostError("GitHub returned HTTP 403"))
+    )
+
+    response = client.post(
+        "/v1/diffcomment",
+        json={
+            "config_repo": "https://github.com/acme/config",
+            "commit": "deadbeef",
+            "pull_request": 7,
+        },
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == ["accepted", "error"]
+    assert events[1][1] == {
+        "status": 502,
+        "error": "comment_post_failed",
+        "message": "GitHub returned HTTP 403",
+    }

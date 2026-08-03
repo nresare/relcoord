@@ -2,6 +2,80 @@
 
 Small HTTP service for registering image versions and resolving the latest known version per image.
 
+## Manifest diff comments
+
+`POST /v1/diffcomment` reports what a config commit *would* do to the manifests
+repositories, and comments the result on a pull request. It does the same work as
+`POST /v1/change` — checks out the config commit, clones each configured output
+repository, runs `manifest-builder`, and lets it create its manifest commit — but
+stops there: nothing is pushed. The diff between the commit each manifests
+checkout was cloned at and the commit `manifest-builder` created is what the
+comment describes, so it is exactly the change a `/v1/change` for the same commit
+would push.
+
+```bash
+curl -H 'content-type: application/json' \
+  -d '{"config_repo": "https://github.com/example/system",
+       "commit": "deadbeef", "pull_request": 42, "system": true}' \
+  http://localhost:8080/v1/diffcomment
+```
+
+The request takes `config_repo`, `commit`, and the same optional `config_path`
+and `system` fields as `/v1/change`; `image_repo` and `tag` are rejected, because
+a diff reports what a config commit generates rather than registering a version.
+`pull_request` is optional: with it, relcoord posts the comment to that pull
+request of `config_repo`, which then has to be an `https://github.com` URL;
+without it, the response carries the comment body it would have posted and
+nothing is sent to GitHub.
+
+The token that posts the comment is an idcat-issued installation token for
+`config_repo`, taken from the same per-repository cache the clones use, so the
+GitHub app configured under `[idcat]` needs permission to write pull request
+comments on the repositories that call this endpoint.
+
+A diff spanning every cluster a deployment generates for is more than a reviewer
+wants to read, so `diff-output` names the single output to report on:
+
+```toml
+diff-output = "example-dev"
+```
+
+Only that output is generated, and only its manifests repository is cloned; the
+other outputs are left alone. The name has to match one of the `[[output]]`
+entries, which relcoord checks at startup. Without `diff-output`, a diff covers
+every configured output, with a heading per manifests repository.
+
+The `200` response body reports the diff and the comment:
+
+```json
+{
+  "config_repo": "https://github.com/example/system",
+  "commit": "deadbeef",
+  "pull_request": 42,
+  "generated": 37,
+  "outputs": [
+    {"name": "example-dev", "repository": "https://github.com/example/manifests",
+     "directory": "example-dev", "generated": 37}
+  ],
+  "diffs": [
+    {"repository": "https://github.com/example/manifests",
+     "stat": " example-dev/api.yaml | 2 +-\n", "summary": "", "diff": "diff --git ..."}
+  ],
+  "comment": {"posted": true, "url": "https://github.com/...", "body": "..."}
+}
+```
+
+Every generated manifest carries a deploy-id annotation, and a change to a shared
+label or annotation rewrites every manifest that has it, so the comment
+summarizes those repeated metadata-only changes and leaves them out of the diff it
+shows. `diffs[].diff` is always the unabridged diff, which is where the comment
+points a reader who needs the part it left out.
+
+`Accept: text/event-stream` works here too, with the same event shapes as
+`/v1/change` and phases `workspace`, `source-checkout`, `deploy-config`,
+`manifests-checkout`, `generate`, `generated`, `diff`, `no-changes`, `comment`,
+`commented` and `no-comment`.
+
 ## Progress streaming
 
 `POST /v1/change` normally answers with a single `202` JSON body once the change
