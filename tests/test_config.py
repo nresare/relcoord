@@ -213,6 +213,44 @@ def test_settings_parses_output_entries(tmp_path: Path) -> None:
     assert settings.outputs[1].vars["cluster_name"] == "example-prod"
 
 
+def test_settings_parses_output_target(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+        target = "dev"
+
+        [[output]]
+        name = "example-prod"
+        repository = "https://github.com/example/manifests"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert settings.outputs[0].target == "dev"
+    assert settings.outputs[0].target_name == "dev"
+    assert settings.outputs[1].target is None
+    assert settings.outputs[1].target_name == "example-prod"
+
+
+def test_settings_rejects_empty_output_target(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/example/manifests"
+        target = ""
+        """
+    )
+
+    with pytest.raises(ValueError, match="output.target must be a non-empty string"):
+        Settings.from_toml(config)
+
+
 def test_settings_defaults_output_directory_to_repository_root(
     tmp_path: Path,
 ) -> None:

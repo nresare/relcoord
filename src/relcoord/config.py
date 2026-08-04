@@ -134,10 +134,32 @@ class IdcatSettings:
 
 @dataclass(frozen=True)
 class OutputSettings:
+    """One manifests destination, and what manifest-builder generates into it.
+
+    ``vars`` and ``target`` both say which of a config directory's manifests
+    this output wants, for the two config directory layouts manifest-builder
+    supports: a config directory that declares config blocks directly is
+    rendered with ``vars``, and one that declares targets picks a ``target``.
+    Which of the two applies is a property of the config commit being processed,
+    not of this output, so an output serving both kinds of repository carries
+    both.
+    """
+
     name: str
     repository: str
     directory: Path
     vars: dict[str, TemplateValue] = field(default_factory=dict)
+    target: str | None = None
+
+    @property
+    def target_name(self) -> str:
+        """The target this output generates from a targets config directory.
+
+        Targets are named in the config repository rather than here, so an
+        output that does not say otherwise generates the target sharing its
+        name.
+        """
+        return self.name if self.target is None else self.target
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> OutputSettings:
@@ -152,6 +174,7 @@ class OutputSettings:
             repository=repository,
             directory=directory,
             vars=_output_vars(raw_vars),
+            target=_optional_output_string(data, "target"),
         )
 
 
@@ -314,6 +337,15 @@ def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:
 
 def _required_output_string(data: dict[str, Any], key: str) -> str:
     value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"output.{key} must be a non-empty string")
+    return value
+
+
+def _optional_output_string(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"output.{key} must be a non-empty string")
     return value

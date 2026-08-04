@@ -15,9 +15,19 @@ from typing import Any, Protocol, cast
 from dulwich import porcelain
 from dulwich.objects import Commit, ObjectID
 from dulwich.repo import Repo
-from manifest_builder import GenerationResult, generate
+from manifest_builder import GenerationResult
 
-from relcoord.config import IdcatSettings, OutputSettings, TemplateValue
+# manifest_builder.generate does not forward the target argument, so relcoord
+# calls the api function it wraps.
+from manifest_builder.api import generate
+from manifest_builder.config import (
+    TARGETS_VERSION,
+    config_version,
+    find_config_file,
+    load_toml_file,
+)
+
+from relcoord.config import IdcatSettings, OutputSettings
 from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
 from relcoord.github import GithubCommentError, GithubIssueCommenter, IssueCommenter
 from relcoord.kubernetes import KubernetesDeploymentDetector
@@ -168,7 +178,11 @@ class ChangeProcessor:
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
-            message = f"found deploy config at {deploy_config} (system mode: {system})"
+            declares_targets = _declares_targets(deploy_config)
+            message = (
+                f"found deploy config at {deploy_config} (system mode: {system}, "
+                f"targets: {declares_targets})"
+            )
             logger.info("change step 3/7: %s", message)
             report(
                 "deploy-config",
@@ -176,6 +190,7 @@ class ChangeProcessor:
                 deploy_config=str(deploy_config),
                 system=system,
                 namespace=namespace,
+                targets=declares_targets,
             )
 
             repo_root = Path("/")
@@ -199,11 +214,12 @@ class ChangeProcessor:
                 for output in _outputs_for_repository(output_settings, repository):
                     output_path = manifests_checkout / output.directory
                     output_path.mkdir(parents=True, exist_ok=True)
+                    selection = _generate_selection(output, declares_targets)
                     logger.info(
                         "change step 5/7: invoking manifest-builder generate("
                         "output=%s, deploy_config=%s, manifests_checkout=%s, "
                         "repo_root=%s, create_commit=%s, image=%s, namespace=%s, "
-                        "vars=%s)",
+                        "%s)",
                         output.name,
                         deploy_config,
                         output_path,
@@ -211,7 +227,7 @@ class ChangeProcessor:
                         create_commit,
                         image,
                         namespace,
-                        _vars_log_summary(output.vars),
+                        _selection_log_summary(selection),
                     )
                     report(
                         "generate",
@@ -219,6 +235,7 @@ class ChangeProcessor:
                         output=output.name,
                         repository=repository,
                         directory=str(output.directory),
+                        **_selection_detail(selection),
                     )
                     generation_result = generate(
                         deploy_config,
@@ -227,7 +244,7 @@ class ChangeProcessor:
                         create_commit=create_commit,
                         image=image,
                         namespace=namespace,
-                        vars=output.vars,
+                        **selection,
                     )
                     generated = _written_paths(generation_result)
                     relative_paths = [
@@ -436,7 +453,11 @@ class DiffCommentProcessor:
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
-            message = f"found deploy config at {deploy_config} (system mode: {system})"
+            declares_targets = _declares_targets(deploy_config)
+            message = (
+                f"found deploy config at {deploy_config} (system mode: {system}, "
+                f"targets: {declares_targets})"
+            )
             logger.info("diff step 3/6: %s", message)
             report(
                 "deploy-config",
@@ -444,6 +465,7 @@ class DiffCommentProcessor:
                 deploy_config=str(deploy_config),
                 system=system,
                 namespace=namespace,
+                targets=declares_targets,
             )
 
             output_diffs: list[OutputDiff] = []
@@ -466,15 +488,16 @@ class DiffCommentProcessor:
                 for output in _outputs_for_repository(output_settings, repository):
                     output_path = manifests_checkout / output.directory
                     output_path.mkdir(parents=True, exist_ok=True)
+                    selection = _generate_selection(output, declares_targets)
                     logger.info(
                         "diff step 5/6: invoking manifest-builder generate("
                         "output=%s, deploy_config=%s, manifests_checkout=%s, "
-                        "namespace=%s, vars=%s)",
+                        "namespace=%s, %s)",
                         output.name,
                         deploy_config,
                         output_path,
                         namespace,
-                        _vars_log_summary(output.vars),
+                        _selection_log_summary(selection),
                     )
                     report(
                         "generate",
@@ -482,6 +505,7 @@ class DiffCommentProcessor:
                         output=output.name,
                         repository=repository,
                         directory=str(output.directory),
+                        **_selection_detail(selection),
                     )
                     generation_result = generate(
                         deploy_config,
@@ -490,7 +514,7 @@ class DiffCommentProcessor:
                         create_commit=True,
                         image=None,
                         namespace=namespace,
-                        vars=output.vars,
+                        **selection,
                     )
                     generated = _written_paths(generation_result)
                     message = (
@@ -726,10 +750,43 @@ def _outputs_for_repository(
     return tuple(output for output in outputs if output.repository == repository)
 
 
-def _vars_log_summary(vars: dict[str, TemplateValue]) -> str:
-    if not vars:
-        return "none"
-    return ", ".join(sorted(vars))
+def _declares_targets(deploy_config: Path) -> bool:
+    """Report whether a config directory declares targets.
+
+    manifest-builder takes what to generate either as template variables or, for
+    a ``version = 2`` config directory, as the name of a target, so relcoord has
+    to know which layout a config commit uses before it calls generate(). A
+    directory holding no top-level config file at all is left to manifest-builder
+    to report on, since it says that better than a version check would.
+    """
+    try:
+        config_file = find_config_file(deploy_config)
+    except FileNotFoundError:
+        return False
+    return config_version(load_toml_file(config_file), config_file) == TARGETS_VERSION
+
+
+def _generate_selection(
+    output: OutputSettings, declares_targets: bool
+) -> dict[str, Any]:
+    """Return the generate() argument that picks what an output generates."""
+    if declares_targets:
+        return {"target": output.target_name}
+    return {"vars": output.vars}
+
+
+def _selection_log_summary(selection: dict[str, Any]) -> str:
+    target = selection.get("target")
+    if target is not None:
+        return f"target={target}"
+    vars = selection["vars"]
+    return f"vars={', '.join(sorted(vars)) if vars else 'none'}"
+
+
+def _selection_detail(selection: dict[str, Any]) -> dict[str, Any]:
+    """Report the chosen target in progress, where vars would be too much."""
+    target = selection.get("target")
+    return {} if target is None else {"target": target}
 
 
 def _start_deployment_detection(

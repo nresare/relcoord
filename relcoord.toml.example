@@ -21,10 +21,16 @@ cluster_name = "example-dev"
 account_id = 111122223333
 issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID"
 
+# The manifest-builder target this output generates, for a config repository
+# whose top-level config.toml says version = 2. Defaults to the output name,
+# which is what "example-dev" above relies on. Config repositories that declare
+# config blocks directly are generated with [output.vars] instead, so an output
+# serving both kinds of repository configures both.
 [[output]]
 name = "example-prod"
 repository = "https://github.com/example/manifests"
 directory = "example-prod"
+target = "prod"
 
 [output.vars]
 cluster_name = "example-prod"

@@ -418,6 +418,112 @@ def test_change_processor_generates_configured_outputs_with_vars(
     ]
 
 
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        pytest.param(None, False, id="no-config-file"),
+        pytest.param('[simple.api]\nimage = "api:1"\n', False, id="blocks"),
+        pytest.param('version = 1\n[simple.api]\nimage = "api:1"\n', False, id="v1"),
+        pytest.param('version = 2\n\n[[target]]\nname = "dev"\n', True, id="v2"),
+    ],
+)
+def test_declares_targets_reads_the_top_level_config_version(
+    tmp_path: Path, contents: str | None, expected: bool
+) -> None:
+    if contents is not None:
+        (tmp_path / "config.toml").write_text(contents)
+
+    assert change._declares_targets(tmp_path) is expected
+
+
+def test_declares_targets_reads_a_manifest_builder_toml(tmp_path: Path) -> None:
+    (tmp_path / "manifest-builder.toml").write_text(
+        'version = 2\n\n[[target]]\nname = "dev"\n'
+    )
+
+    assert change._declares_targets(tmp_path) is True
+
+
+def test_change_processor_generates_targets_for_a_version_2_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    outputs = [
+        # The vars stay configured, since the same output also serves config
+        # repositories that declare config blocks directly.
+        OutputSettings(
+            name="example-dev",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-dev"),
+            vars={"cluster_name": "example-dev"},
+        ),
+        OutputSettings(
+            name="example-prod",
+            repository="https://github.com/acme/manifests.git",
+            directory=Path("example-prod"),
+            vars={"cluster_name": "example-prod"},
+            target="prod",
+        ),
+    ]
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        deploy_config = target / ".deploy"
+        deploy_config.mkdir(parents=True)
+        (deploy_config / "config.toml").write_text(
+            'version = 2\n\n[[target]]\nname = "example-dev"\n'
+        )
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path,
+        output_path: Path,
+        *,
+        repo_root: Path,
+        create_commit: bool,
+        image: str | None,
+        namespace: str,
+        target: str,
+    ) -> GenerationResult:
+        calls.append(("generate", output_path.name, target))
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified={
+                Ref(kind="Deployment", namespace="config", name="api")
+            },
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *args, **kwargs: None)
+
+    events: list[ChangeProgress] = []
+    result = ChangeProcessor(outputs=outputs).process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        progress=events.append,
+    )
+
+    assert result.generated_count == 2
+    # An output that names no target generates the one sharing its name.
+    assert calls == [
+        ("generate", "example-dev", "example-dev"),
+        ("generate", "example-prod", "prod"),
+    ]
+    by_phase = {event.phase: event for event in events}
+    assert by_phase["deploy-config"].detail["targets"] is True
+    assert by_phase["generate"].detail["target"] == "prod"
+
+
 def test_change_processor_skips_commit_and_push_when_no_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

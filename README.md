@@ -178,3 +178,24 @@ cluster_name = "example-dev"
 account_id = 111122223333
 issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEDEVCLUSTERID"
 ```
+
+`manifest-builder` config directories come in two layouts, told apart by the
+`version` field of the top-level `config.toml` (or `manifest-builder.toml`) of
+the commit being processed. A directory that declares config blocks directly
+(`version = 1`, or no `version` at all) is rendered with the `vars` of the
+output. A directory that declares `[[target]]` entries (`version = 2`) instead
+picks one target by name, and relcoord passes the output's `target`:
+
+```toml
+[[output]]
+name = "example-dev"
+repository = "https://github.com/example/manifests"
+directory = "example-dev"
+target = "dev"
+```
+
+`target` defaults to the name of the output, so it only needs setting when the
+targets in the config repositories are named differently. Which of the two
+applies is a property of each config commit rather than of the output, so an
+output serving both kinds of repository keeps its `vars` and its `target`
+configured side by side.

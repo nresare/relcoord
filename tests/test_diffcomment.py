@@ -61,13 +61,24 @@ def _fake_git(
     calls: list[tuple[object, ...]] | None = None,
     diff: ManifestDiff | None = None,
     written: int = 1,
+    targets: bool = False,
 ) -> None:
-    """Replace the git and manifest-builder work with recorded fakes."""
+    """Replace the git and manifest-builder work with recorded fakes.
+
+    ``targets`` writes a ``version = 2`` top-level config into the checked out
+    config directory, for which manifest-builder takes a target rather than
+    template variables.
+    """
     recorded = calls if calls is not None else []
 
     def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
         recorded.append(("checkout", repo, commit, target.name, idcat))
-        (target / ".deploy").mkdir(parents=True)
+        deploy_config = target / ".deploy"
+        deploy_config.mkdir(parents=True)
+        if targets:
+            (deploy_config / "config.toml").write_text(
+                'version = 2\n\n[[target]]\nname = "dev"\n'
+            )
 
     def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
         recorded.append(("clone", repo, target.name, kwargs))
@@ -81,7 +92,8 @@ def _fake_git(
         create_commit: bool,
         image: str | None,
         namespace: str | None,
-        vars: dict[str, object],
+        vars: dict[str, object] | None = None,
+        target: str | None = None,
     ) -> GenerationResult:
         recorded.append(
             (
@@ -91,7 +103,7 @@ def _fake_git(
                 create_commit,
                 image,
                 namespace,
-                vars,
+                vars if target is None else target,
             )
         )
         return GenerationResult(
@@ -326,6 +338,38 @@ def test_diff_reports_only_the_configured_output(
             None,
             "config",
             {},
+        )
+    ]
+
+
+def test_diff_generates_a_target_for_a_version_2_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    _fake_git(monkeypatch, tmp_path, calls=calls, targets=True)
+    outputs = [
+        OutputSettings(
+            name="example-dev",
+            repository=MANIFESTS_REPO,
+            directory=Path("example-dev"),
+            vars={"cluster_name": "example-dev"},
+            target="dev",
+        )
+    ]
+
+    DiffCommentProcessor(outputs=outputs, commenter=Commenter()).diff(
+        CONFIG_REPO, "deadbeef"
+    )
+
+    assert [call for call in calls if call[0] == "generate"] == [
+        (
+            "generate",
+            ".deploy",
+            Path("manifests/example-dev"),
+            True,
+            None,
+            "config",
+            "dev",
         )
     ]
 
