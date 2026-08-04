@@ -15,11 +15,7 @@ from typing import Any, Protocol, cast
 from dulwich import porcelain
 from dulwich.objects import Commit, ObjectID
 from dulwich.repo import Repo
-from manifest_builder import GenerationResult
-
-# manifest_builder.generate does not forward the target argument, so relcoord
-# calls the api function it wraps.
-from manifest_builder.api import generate
+from manifest_builder import GenerationResult, generate
 from manifest_builder.config import (
     TARGETS_VERSION,
     config_version,
