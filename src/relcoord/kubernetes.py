@@ -1,20 +1,41 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
+"""Observing a change materialise in a Kubernetes cluster.
+
+manifest-builder reports which objects a change touched and stamps each of them
+with a deploy-id annotation. This module connects to the cluster those manifests
+are deployed to and waits, using watches rather than polling, until every
+changed object carries that deploy-id and every removed object is gone.
+"""
+
 from __future__ import annotations
 
+import json
 import logging
+import ssl
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import boto3
 import httpx
 
-from relcoord.auth import KUBERNETES_CA_CERT_PATH, KUBERNETES_TOKEN_PATH
+from relcoord.config import ClusterSettings
+from relcoord.eks import EksTokenAuth
 
 logger = logging.getLogger(__name__)
 
-KUBERNETES_API_URL = "https://kubernetes.default.svc"
 DEPLOY_ID_ANNOTATION = "noa.re/deploy-id"
+DEFAULT_TIMEOUT_SECONDS = 300.0
+# How long a single watch is allowed to stay open. The API server closes the
+# stream when it expires, and a fresh list re-establishes a resourceVersion to
+# watch from. Long enough that the usual wait needs only one stream.
+WATCH_TIMEOUT_SECONDS = 300.0
+# How long to wait before opening a watch that the API server just closed
+# straight away, so a cluster refusing watches does not spin.
+WATCH_RETRY_SECONDS = 1.0
+CONNECT_TIMEOUT_SECONDS = 10.0
 
 
 class KubernetesObjectRef(Protocol):
@@ -30,43 +51,89 @@ class DeploymentDetectionError(Exception):
     pass
 
 
-class KubernetesObjectNotFound(Exception):
-    pass
-
-
 @dataclass(frozen=True)
 class KubernetesResource:
+    """A REST resource the API server serves, as reported by discovery."""
+
     path_prefix: str
     name: str
     namespaced: bool
 
-    def object_path(self, ref: KubernetesObjectRef) -> str:
-        if self.namespaced:
-            if ref.namespace is None:
-                raise DeploymentDetectionError(
-                    f"{ref.kind}/{ref.name} must have a namespace"
-                )
-            return (
-                f"{self.path_prefix}/namespaces/{ref.namespace}/{self.name}/{ref.name}"
-            )
-        return f"{self.path_prefix}/{self.name}/{ref.name}"
+    def collection_path(self, namespace: str | None) -> str:
+        if namespace is None:
+            return f"{self.path_prefix}/{self.name}"
+        return f"{self.path_prefix}/namespaces/{namespace}/{self.name}"
+
+
+def cluster_client(cluster: ClusterSettings) -> httpx.Client:
+    """Return a client that talks to ``cluster`` as the ambient AWS identity."""
+    if not cluster.ca_path.exists():
+        raise DeploymentDetectionError(
+            f"CA certificate {cluster.ca_path} for cluster {cluster.name} does "
+            "not exist"
+        )
+    try:
+        ssl_context = ssl.create_default_context(cafile=str(cluster.ca_path))
+    except ssl.SSLError as exc:
+        raise DeploymentDetectionError(
+            f"CA certificate {cluster.ca_path} for cluster {cluster.name} is not "
+            f"a readable PEM certificate: {exc}"
+        ) from exc
+    session = boto3.Session(region_name=cluster.region)
+    return httpx.Client(
+        base_url=cluster.api_endpoint.rstrip("/"),
+        verify=ssl_context,
+        auth=EksTokenAuth(session, cluster.eks_name),
+        # Reads have to outlast a watch that is idle but healthy, which is the
+        # normal state of a watch waiting for a deployment to roll out.
+        timeout=httpx.Timeout(
+            WATCH_TIMEOUT_SECONDS + 60.0, connect=CONNECT_TIMEOUT_SECONDS
+        ),
+    )
 
 
 class KubernetesDeploymentDetector:
+    """Waits for a change's objects to materialise in one cluster.
+
+    Objects are waited for one at a time. A list narrowed to a single name
+    settles whether the object is already in the state the change asked for, and
+    when it is not, a watch from that list's resourceVersion reports the moment
+    it gets there. Waiting in sequence is enough because a change has only
+    materialised once every one of its objects has, and it keeps one stream open
+    at a time rather than one per object.
+    """
+
     def __init__(
         self,
         *,
-        api_url: str = KUBERNETES_API_URL,
-        timeout_seconds: float = 300,
-        interval_seconds: float = 5,
-        client: httpx.Client | None = None,
+        client: httpx.Client,
+        cluster_name: str = "",
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        watch_timeout_seconds: float = WATCH_TIMEOUT_SECONDS,
+        retry_delay_seconds: float = WATCH_RETRY_SECONDS,
+        owns_client: bool = False,
     ) -> None:
-        self._api_url = api_url.rstrip("/")
+        self._client = client
+        self._cluster_name = cluster_name
         self._timeout_seconds = timeout_seconds
-        self._interval_seconds = interval_seconds
-        self._client = client or httpx.Client(**_kubernetes_request_options())
-        self._owns_client = client is None
+        self._watch_timeout_seconds = watch_timeout_seconds
+        self._retry_delay_seconds = retry_delay_seconds
+        self._owns_client = owns_client
         self._resources_by_kind: dict[str, list[KubernetesResource]] | None = None
+
+    @classmethod
+    def for_cluster(
+        cls,
+        cluster: ClusterSettings,
+        *,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> KubernetesDeploymentDetector:
+        return cls(
+            client=cluster_client(cluster),
+            cluster_name=cluster.name,
+            timeout_seconds=timeout_seconds,
+            owns_client=True,
+        )
 
     def close(self) -> None:
         if self._owns_client:
@@ -80,82 +147,191 @@ class KubernetesDeploymentDetector:
         removed: set[KubernetesObjectRef],
     ) -> None:
         deadline = time.monotonic() + self._timeout_seconds
-        pending: list[str] = []
+        waited_for = 0
+        for ref in sorted(created_or_modified, key=_object_ref_sort_key):
+            self._wait_for_object(
+                ref,
+                deploy_id=deploy_id,
+                satisfied=lambda obj: _deploy_id_of(obj) == deploy_id,
+                describe=lambda obj: (
+                    "it has not appeared"
+                    if obj is None
+                    else f"it has deploy-id {_deploy_id_of(obj) or '<missing>'!r}"
+                ),
+                goal=f"deploy-id {deploy_id}",
+                deadline=deadline,
+            )
+            waited_for += 1
+        for ref in sorted(removed, key=_object_ref_sort_key):
+            self._wait_for_object(
+                ref,
+                deploy_id=deploy_id,
+                satisfied=lambda obj: obj is None,
+                describe=lambda obj: "it still exists",
+                goal="removal",
+                deadline=deadline,
+            )
+            waited_for += 1
+        logger.info(
+            "change with deploy-id %s has materialised in cluster %s: "
+            "%d object(s) observed",
+            deploy_id,
+            self._cluster_name or "<unnamed>",
+            waited_for,
+        )
+
+    def _wait_for_object(
+        self,
+        ref: KubernetesObjectRef,
+        *,
+        deploy_id: str,
+        satisfied: Callable[[dict[str, Any] | None], bool],
+        describe: Callable[[dict[str, Any] | None], str],
+        goal: str,
+        deadline: float,
+    ) -> None:
+        resource = self._resource_for(ref)
         while True:
-            pending = self._pending(deploy_id, created_or_modified, removed)
-            if not pending:
+            obj = self._list_object(resource, ref)
+            if satisfied(obj):
+                self._log_observed(ref, goal)
                 return
-            if time.monotonic() >= deadline:
-                waiting_for = "; ".join(pending)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise DeploymentDetectionError(
-                    "deployment detection timed out after "
-                    f"{self._timeout_seconds:g}s waiting for {waiting_for}"
+                    f"timed out after {self._timeout_seconds:g}s waiting for "
+                    f"{_format_ref(ref)} to reach {goal} in cluster "
+                    f"{self._cluster_name or '<unnamed>'}: {describe(obj)}"
                 )
             logger.info(
-                "deployment detection waiting for %d Kubernetes object(s): %s",
-                len(pending),
-                "; ".join(pending),
+                "watching %s in cluster %s for %s (deploy-id %s): %s",
+                _format_ref(ref),
+                self._cluster_name or "<unnamed>",
+                goal,
+                deploy_id,
+                describe(obj),
             )
-            time.sleep(self._interval_seconds)
+            started = time.monotonic()
+            for event_type, event_object in self._watch_object(
+                resource, ref, min(self._watch_timeout_seconds, remaining)
+            ):
+                observed = None if event_type == "DELETED" else event_object
+                if satisfied(observed):
+                    self._log_observed(ref, goal)
+                    return
+            # The watch ended without the object reaching the state the change
+            # asked for, which is what an expired watch looks like, and the loop
+            # opens another one. A watch that ends immediately instead means the
+            # API server is dropping them, so this waits a little rather than
+            # spinning through the whole timeout in a tight loop.
+            if time.monotonic() - started < self._retry_delay_seconds:
+                time.sleep(self._retry_delay_seconds)
 
-    def _pending(
+    def _log_observed(self, ref: KubernetesObjectRef, goal: str) -> None:
+        logger.info(
+            "observed %s in cluster %s reaching %s",
+            _format_ref(ref),
+            self._cluster_name or "<unnamed>",
+            goal,
+        )
+
+    def _list_object(
+        self, resource: KubernetesResource, ref: KubernetesObjectRef
+    ) -> dict[str, Any] | None:
+        """Return the named object, or None when the cluster does not have it."""
+        listing = self._get(
+            resource.collection_path(ref.namespace),
+            params={"fieldSelector": f"metadata.name={ref.name}"},
+        )
+        items = listing.get("items")
+        if not isinstance(items, list):
+            raise DeploymentDetectionError(
+                f"listing {_format_ref(ref)} did not return an item list"
+            )
+        for item in items:
+            if isinstance(item, dict):
+                return item
+        return None
+
+    def _watch_object(
         self,
-        deploy_id: str,
-        created_or_modified: set[KubernetesObjectRef],
-        removed: set[KubernetesObjectRef],
-    ) -> list[str]:
-        pending = []
-        for ref in sorted(created_or_modified, key=_object_ref_sort_key):
-            observed = self._matching_deploy_id(ref, deploy_id)
-            if observed is True:
-                continue
-            if observed is None:
-                pending.append(f"{_format_ref(ref)} has not appeared")
-            else:
-                pending.append(
-                    f"{_format_ref(ref)} has deploy-id {observed!r}, expected {deploy_id!r}"
-                )
+        resource: KubernetesResource,
+        ref: KubernetesObjectRef,
+        timeout_seconds: float,
+    ) -> Iterator[tuple[str, dict[str, Any] | None]]:
+        """Yield (type, object) watch events for one object until the stream ends.
 
-        for ref in sorted(removed, key=_object_ref_sort_key):
-            if self._exists(ref):
-                pending.append(f"{_format_ref(ref)} still exists")
-        return pending
+        The stream is opened without a resourceVersion, which asks the API server
+        for the object's current state first and then updates: relcoord cares
+        about the state an object is in rather than the sequence of changes it
+        went through, so starting from the present loses nothing and cannot miss
+        an event between the list and the watch.
+        """
+        path = resource.collection_path(ref.namespace)
+        params = {
+            "watch": "1",
+            "fieldSelector": f"metadata.name={ref.name}",
+            "timeoutSeconds": str(max(1, int(timeout_seconds))),
+        }
+        try:
+            with self._client.stream("GET", path, params=params) as response:
+                if response.status_code >= 400:
+                    if response.status_code == 410:
+                        # Too old to resume from; the caller lists again.
+                        return
+                    # raise_for_status() reports the body, which a streamed
+                    # response only has once it has been read.
+                    response.read()
+                    response.raise_for_status()
+                for line in response.iter_lines():
+                    event = _watch_event(line)
+                    if event is None:
+                        continue
+                    event_type, event_object = event
+                    if event_type == "ERROR":
+                        logger.info(
+                            "watch of %s returned an error event; listing again",
+                            _format_ref(ref),
+                        )
+                        return
+                    if event_type == "BOOKMARK":
+                        continue
+                    yield event_type, event_object
+        except httpx.HTTPStatusError as exc:
+            raise DeploymentDetectionError(
+                f"watch of {_format_ref(ref)} failed with status "
+                f"{exc.response.status_code}: {exc.response.text}"
+            ) from exc
+        except httpx.ReadTimeout:
+            # The API server should have closed the stream itself; treat a
+            # client-side timeout the same way and list again.
+            logger.debug("watch of %s timed out client side", _format_ref(ref))
+            return
+        except httpx.RequestError as exc:
+            raise DeploymentDetectionError(
+                f"watch of {_format_ref(ref)} failed: {exc}"
+            ) from exc
 
-    def _matching_deploy_id(
-        self, ref: KubernetesObjectRef, deploy_id: str
-    ) -> bool | str | None:
-        observed: str | None = None
-        found = False
-        for resource in self._resources(ref):
-            try:
-                obj = self._get(resource.object_path(ref))
-            except KubernetesObjectNotFound:
-                continue
-            found = True
-            annotations = obj.get("metadata", {}).get("annotations", {})
-            value = annotations.get(DEPLOY_ID_ANNOTATION)
-            if value == deploy_id:
-                return True
-            observed = value
-        if not found:
-            return None
-        return observed if observed is not None else "<missing>"
-
-    def _exists(self, ref: KubernetesObjectRef) -> bool:
-        for resource in self._resources(ref):
-            try:
-                self._get(resource.object_path(ref))
-            except KubernetesObjectNotFound:
-                continue
-            return True
-        return False
-
-    def _resources(self, ref: KubernetesObjectRef) -> list[KubernetesResource]:
+    def _resource_for(self, ref: KubernetesObjectRef) -> KubernetesResource:
         resources = self._matching_resources(ref)
-        if resources:
-            return resources
-        self._resources_by_kind = self._discover_resources()
-        return self._matching_resources(ref)
+        if not resources:
+            self._resources_by_kind = self._discover_resources()
+            resources = self._matching_resources(ref)
+        if not resources:
+            scope = "namespaced" if ref.namespace is not None else "cluster-scoped"
+            raise DeploymentDetectionError(
+                f"cluster {self._cluster_name or '<unnamed>'} serves no "
+                f"{scope} resource of kind {ref.kind}"
+            )
+        if len(resources) > 1:
+            served = ", ".join(
+                f"{resource.path_prefix}/{resource.name}" for resource in resources
+            )
+            raise DeploymentDetectionError(
+                f"kind {ref.kind} is ambiguous in cluster "
+                f"{self._cluster_name or '<unnamed>'}: {served}"
+            )
+        return resources[0]
 
     def _matching_resources(self, ref: KubernetesObjectRef) -> list[KubernetesResource]:
         return [
@@ -177,7 +353,7 @@ class KubernetesDeploymentDetector:
         apis = self._get("/apis")
         for group in apis.get("groups", []):
             group_name = group.get("name")
-            for version in group.get("versions", []):
+            for version in _group_versions(group):
                 version_name = version.get("version")
                 if not isinstance(group_name, str) or not isinstance(version_name, str):
                     continue
@@ -185,13 +361,11 @@ class KubernetesDeploymentDetector:
                 _add_resources(resources, path_prefix, self._get(path_prefix))
         return resources
 
-    def _get(self, path: str) -> dict[str, Any]:
+    def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         try:
-            response = self._client.get(f"{self._api_url}{path}")
+            response = self._client.get(path, params=params)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                raise KubernetesObjectNotFound() from exc
             raise DeploymentDetectionError(
                 f"Kubernetes API GET {path} failed with status "
                 f"{exc.response.status_code}: {exc.response.text}"
@@ -213,14 +387,49 @@ class KubernetesDeploymentDetector:
         return data
 
 
-def _kubernetes_request_options() -> dict[str, Any]:
-    options: dict[str, Any] = {}
-    if KUBERNETES_CA_CERT_PATH.exists():
-        options["verify"] = KUBERNETES_CA_CERT_PATH
-    if KUBERNETES_TOKEN_PATH.exists():
-        token = KUBERNETES_TOKEN_PATH.read_text().strip()
-        options["headers"] = {"Authorization": f"Bearer {token}"}
-    return options
+def _group_versions(group: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the versions of an API group to discover resources from.
+
+    Only the preferred version, where the group names one: a kind served by
+    several versions of the same group is one kind, and discovering all of them
+    would make it look ambiguous.
+    """
+    preferred = group.get("preferredVersion")
+    if isinstance(preferred, dict) and preferred.get("version"):
+        return [preferred]
+    versions = group.get("versions", [])
+    return [version for version in versions if isinstance(version, dict)]
+
+
+def _watch_event(line: str) -> tuple[str, dict[str, Any] | None] | None:
+    """Parse one line of a watch stream into an (type, object) pair."""
+    if not line.strip():
+        return None
+    try:
+        event = json.loads(line)
+    except ValueError:
+        logger.debug("ignoring unparseable watch event: %s", line[:200])
+        return None
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return None
+    event_object = event.get("object")
+    return event_type, event_object if isinstance(event_object, dict) else None
+
+
+def _deploy_id_of(obj: dict[str, Any] | None) -> str | None:
+    if obj is None:
+        return None
+    metadata = obj.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    annotations = metadata.get("annotations")
+    if not isinstance(annotations, dict):
+        return None
+    value = annotations.get(DEPLOY_ID_ANNOTATION)
+    return value if isinstance(value, str) else None
 
 
 def _add_resources(
@@ -238,7 +447,7 @@ def _add_resources(
             or "/" in name
             or not isinstance(kind, str)
             or not isinstance(namespaced, bool)
-            or "get" not in verbs
+            or "watch" not in verbs
         ):
             continue
         resources.setdefault(kind, []).append(

@@ -199,3 +199,68 @@ targets in the config repositories are named differently. Which of the two
 applies is a property of each config commit rather than of the output, so an
 output serving both kinds of repository keeps its `vars` and its `target`
 configured side by side.
+
+## Deployment detection
+
+With `detect-deployment = true`, a change does not end at the manifests push:
+relcoord goes on to watch the cluster the manifests are deployed to until the
+change has actually materialised there, and logs it when it has.
+
+What it waits for comes from `manifest-builder`, which reports the Kubernetes
+objects each commit touched — kind, namespace where the object has one, and
+name — and stamps every manifest it wrote with a `noa.re/deploy-id` annotation
+identifying that generation. relcoord reports both in the `changed-objects`
+progress event and in the `outputs` of the change response, and then waits for
+each created or modified object to carry that deploy-id and each removed object
+to be gone. Objects are waited for with a list narrowed to the object's name
+followed by a watch, so a rollout is observed as it happens rather than polled
+for.
+
+Each output says which cluster its manifests are deployed to, and each cluster
+is reached with the AWS credentials relcoord itself runs as:
+
+```toml
+detect-deployment = true
+
+[[output]]
+name = "example-dev"
+repository = "https://github.com/example/manifests"
+directory = "example-dev"
+cluster = "example-dev"
+
+[[cluster]]
+name = "example-dev"
+api-endpoint = "https://EXAMPLEDEVCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
+ca-path = "/etc/relcoord/example-dev-ca.pem"
+region = "eu-west-1"
+```
+
+Authentication is the EKS bearer token: a presigned STS `GetCallerIdentity` URL
+signed as relcoord's own identity and re-signed as it ages. The cluster
+therefore needs an access entry for relcoord's IAM role, granting at least
+`get`, `list` and `watch` on the objects it deploys — and because the token is
+signed rather than fetched, that role can live in a different AWS account from
+the cluster.
+
+The API endpoint and CA certificate are configured rather than looked up:
+`eks:DescribeCluster` only resolves clusters in the caller's own account, so
+there is no call that returns them for a cluster elsewhere. Both come from, run
+in the cluster's own account:
+
+```bash
+aws eks describe-cluster --name example-dev --query 'cluster.{endpoint:endpoint,ca:certificateAuthority.data}'
+```
+
+`ca-path` points at that CA decoded from base64 into a PEM file. `region`
+defaults to the region of relcoord's AWS session, and `eks-cluster-name` to the
+name of the cluster entry.
+
+The `relcoord-eks-kubeconfig` command writes the same credentials into a
+kubeconfig context, which is the quickest way to check that a cluster's access
+entry works before turning detection on:
+
+```bash
+relcoord-eks-kubeconfig example-dev --region eu-west-1 \
+  --endpoint https://EXAMPLEDEVCLUSTERID.gr7.eu-west-1.eks.amazonaws.com \
+  --ca-file /etc/relcoord/example-dev-ca.pem
+```

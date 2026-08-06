@@ -133,6 +133,41 @@ class IdcatSettings:
 
 
 @dataclass(frozen=True)
+class ClusterSettings:
+    """One Kubernetes cluster relcoord can watch a change materialise in.
+
+    The API endpoint and CA certificate are configured rather than looked up
+    because eks:DescribeCluster only resolves clusters in the caller's own
+    account, and the clusters relcoord deploys to are generally elsewhere.
+    """
+
+    name: str
+    api_endpoint: str
+    ca_path: Path
+    region: str | None = None
+    eks_cluster_name: str | None = None
+
+    @property
+    def eks_name(self) -> str:
+        """The cluster name EKS knows, which the token is bound to.
+
+        Cluster entries are named for relcoord's own configuration, which is
+        usually but not always what the cluster is called in EKS.
+        """
+        return self.name if self.eks_cluster_name is None else self.eks_cluster_name
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> ClusterSettings:
+        return cls(
+            name=_required_cluster_string(data, "name"),
+            api_endpoint=_required_cluster_string(data, "api-endpoint"),
+            ca_path=Path(_required_cluster_string(data, "ca-path")),
+            region=_optional_cluster_string(data, "region"),
+            eks_cluster_name=_optional_cluster_string(data, "eks-cluster-name"),
+        )
+
+
+@dataclass(frozen=True)
 class OutputSettings:
     """One manifests destination, and what manifest-builder generates into it.
 
@@ -150,6 +185,7 @@ class OutputSettings:
     directory: Path
     vars: dict[str, TemplateValue] = field(default_factory=dict)
     target: str | None = None
+    cluster: str | None = None
 
     @property
     def target_name(self) -> str:
@@ -175,6 +211,7 @@ class OutputSettings:
             directory=directory,
             vars=_output_vars(raw_vars),
             target=_optional_output_string(data, "target"),
+            cluster=_optional_output_string(data, "cluster"),
         )
 
 
@@ -185,6 +222,7 @@ class Settings:
     log_level: str = "INFO"
     manifests_repository: str | None = None
     outputs: list[OutputSettings] = field(default_factory=list)
+    clusters: list[ClusterSettings] = field(default_factory=list)
     diff_output: str | None = None
     detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
@@ -216,12 +254,20 @@ class Settings:
         if not isinstance(raw_outputs, list):
             raise TypeError("output must be an array of tables")
         outputs = _outputs_from_entries(raw_outputs)
+        raw_clusters = data.get("cluster", [])
+        if not isinstance(raw_clusters, list):
+            raise TypeError("cluster must be an array of tables")
+        clusters = _clusters_from_entries(raw_clusters)
         manifests_repository = _optional_string(data, "manifests-repository")
         if manifests_repository is not None and outputs:
             raise ValueError(
                 "configure either manifests-repository or [[output]], not both"
             )
         diff_output = _diff_output(data, outputs)
+        detect_deployment = _bool_or_default(
+            data, "detect-deployment", cls.detect_deployment
+        )
+        _check_output_clusters(outputs, clusters, detect_deployment)
         roles: list[RoleConfig] = []
         seen: set[str] = set()
         for entry in raw_roles:
@@ -243,12 +289,9 @@ class Settings:
             log_level=_log_level_or_default(data, "log-level", cls.log_level),
             manifests_repository=manifests_repository,
             outputs=outputs,
+            clusters=clusters,
             diff_output=diff_output,
-            detect_deployment=_bool_or_default(
-                data,
-                "detect-deployment",
-                cls.detect_deployment,
-            ),
+            detect_deployment=detect_deployment,
             persistence=(
                 PersistenceSettings.from_mapping(persistence) if persistence else None
             ),
@@ -333,6 +376,71 @@ def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:
         seen.add(output.name)
         outputs.append(output)
     return outputs
+
+
+def _clusters_from_entries(entries: list[Any]) -> list[ClusterSettings]:
+    clusters: list[ClusterSettings] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise TypeError("each cluster entry must be a table")
+        cluster = ClusterSettings.from_mapping(entry)
+        if cluster.name in seen:
+            raise ValueError(f"duplicate cluster '{cluster.name}'")
+        seen.add(cluster.name)
+        clusters.append(cluster)
+    return clusters
+
+
+def _check_output_clusters(
+    outputs: list[OutputSettings],
+    clusters: list[ClusterSettings],
+    detect_deployment: bool,
+) -> None:
+    """Check that outputs name a configured cluster, and have one when needed.
+
+    Deployment detection watches the cluster an output's manifests are deployed
+    to, so with detection enabled every output has to say which cluster that is.
+    """
+    configured = {cluster.name for cluster in clusters}
+    for output in outputs:
+        if output.cluster is not None and output.cluster not in configured:
+            expected = ", ".join(sorted(configured))
+            raise ValueError(
+                f"output '{output.name}' names cluster '{output.cluster}', which "
+                "is not configured"
+                + (f"; expected one of {expected}" if expected else "")
+            )
+    if not detect_deployment:
+        return
+    if not outputs:
+        raise ValueError(
+            "detect-deployment requires [[output]] entries naming the cluster to "
+            "watch; manifests-repository does not say which cluster its manifests "
+            "are deployed to"
+        )
+    missing = [output.name for output in outputs if output.cluster is None]
+    if missing:
+        raise ValueError(
+            "detect-deployment requires every output to name a cluster; "
+            f"{', '.join(sorted(missing))} does not"
+        )
+
+
+def _required_cluster_string(data: dict[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"cluster.{key} must be a non-empty string")
+    return value
+
+
+def _optional_cluster_string(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"cluster.{key} must be a non-empty string")
+    return value
 
 
 def _required_output_string(data: dict[str, Any], key: str) -> str:

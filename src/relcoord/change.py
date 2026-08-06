@@ -23,10 +23,10 @@ from manifest_builder.config import (
     load_toml_file,
 )
 
-from relcoord.config import IdcatSettings, OutputSettings
+from relcoord.config import ClusterSettings, IdcatSettings, OutputSettings
 from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
 from relcoord.github import GithubCommentError, GithubIssueCommenter, IssueCommenter
-from relcoord.kubernetes import KubernetesDeploymentDetector
+from relcoord.kubernetes import KubernetesDeploymentDetector, KubernetesObjectRef
 from relcoord.manifest_diff import (
     DiffSection,
     ManifestDiff,
@@ -125,21 +125,35 @@ class ChangeResult:
 
 @dataclass(frozen=True)
 class OutputResult:
+    """What one configured output contributed to a change.
+
+    ``created_or_modified`` and ``removed`` name the Kubernetes objects the
+    commit touched, which manifest-builder reads back out of the manifests it
+    wrote, and ``deploy_id`` is the value of the noa.re/deploy-id annotation it
+    stamped on each of them. Together they are what deployment detection waits
+    for, and what a caller needs to follow the change into ``cluster``.
+    """
+
     name: str
     repository: str
     directory: Path
     manifests_checkout: Path
     generated_count: int
     deploy_id: str | None = None
+    cluster: str | None = None
+    created_or_modified: tuple[KubernetesObjectRef, ...] = ()
+    removed: tuple[KubernetesObjectRef, ...] = ()
 
 
 @dataclass(frozen=True)
 class ChangeProcessor:
     manifests_repository: str | None = None
     outputs: Sequence[OutputSettings] = ()
+    clusters: Sequence[ClusterSettings] = ()
     idcat: IdcatSettings | None = None
     detect_deployment: bool = False
     deployment_detector: DeploymentDetector | None = None
+    """Detector to use for every output, in place of connecting to its cluster."""
 
     def process(
         self,
@@ -195,7 +209,7 @@ class ChangeProcessor:
             total_generated = 0
 
             for repository, manifests_checkout in checkout_by_repository.items():
-                detection_results: list[tuple[GenerationResult, str | None]] = []
+                detection_results: list[tuple[OutputSettings, GenerationResult]] = []
                 message = f"checking out manifests repo {repository} into {manifests_checkout}"
                 logger.info("change step 4/7: %s", message)
                 report("manifests-checkout", message, repository=repository)
@@ -261,6 +275,27 @@ class ChangeProcessor:
                             "manifest-builder did not return a deploy_id; "
                             "deployment detection requires git-backed generation"
                         )
+                    created_or_modified = _sorted_refs(
+                        generation_result.created_or_modified
+                    )
+                    removed_refs = _sorted_refs(generation_result.removed)
+                    if created_or_modified or removed_refs:
+                        message = _changed_objects_message(
+                            output, created_or_modified, removed_refs, deploy_id
+                        )
+                        logger.info("change step 5/7: %s", message)
+                        report(
+                            "changed-objects",
+                            message,
+                            output=output.name,
+                            repository=repository,
+                            cluster=output.cluster,
+                            deploy_id=deploy_id,
+                            created_or_modified=object_ref_payloads(
+                                created_or_modified
+                            ),
+                            removed=object_ref_payloads(removed_refs),
+                        )
                     output_results.append(
                         OutputResult(
                             name=output.name,
@@ -269,14 +304,17 @@ class ChangeProcessor:
                             manifests_checkout=manifests_checkout,
                             generated_count=len(generated),
                             deploy_id=deploy_id,
+                            cluster=output.cluster,
+                            created_or_modified=created_or_modified,
+                            removed=removed_refs,
                         )
                     )
-                    detection_results.append((generation_result, deploy_id))
+                    detection_results.append((output, generation_result))
                     total_generated += len(generated)
 
                 if not any(
                     result.created_or_modified or result.removed
-                    for result, _ in detection_results
+                    for _, result in detection_results
                 ):
                     message = (
                         f"manifest-builder produced no changes for repo {repository}; "
@@ -321,16 +359,21 @@ class ChangeProcessor:
                 )
 
                 if self.detect_deployment:
-                    for generation_result, deploy_id in detection_results:
+                    for output, generation_result in detection_results:
+                        deploy_id = _deploy_id(generation_result)
+                        cluster = self._cluster_for(output)
                         report(
                             "deployment-detection",
                             "waiting for deployment of manifest-builder deploy-id "
-                            f"{deploy_id}",
+                            f"{deploy_id} in cluster {output.cluster}",
                             deploy_id=deploy_id,
+                            output=output.name,
+                            cluster=output.cluster,
                         )
                         _start_deployment_detection(
                             generation_result,
                             deploy_id,
+                            cluster,
                             self.deployment_detector,
                         )
             return ChangeResult(
@@ -351,6 +394,29 @@ class ChangeProcessor:
 
     def _configured_outputs(self) -> tuple[OutputSettings, ...]:
         return _resolve_output_settings(self.outputs, self.manifests_repository)
+
+    def _cluster_for(self, output: OutputSettings) -> ClusterSettings | None:
+        """Return the cluster an output's manifests are deployed to.
+
+        None where an injected detector stands in for a real cluster, which is
+        how tests and callers that supply their own connection work; a
+        configuration reaching detection without either is a bug rather than
+        something a change request can cause, since config loading rejects it.
+        """
+        if output.cluster is None:
+            if self.deployment_detector is not None:
+                return None
+            raise DeploymentDetectionError(
+                f"output {output.name} does not name a cluster to detect its "
+                "deployment in"
+            )
+        for cluster in self.clusters:
+            if cluster.name == output.cluster:
+                return cluster
+        raise DeploymentDetectionError(
+            f"output {output.name} names cluster {output.cluster}, which is not "
+            "configured"
+        )
 
 
 @dataclass(frozen=True)
@@ -779,9 +845,60 @@ def _selection_detail(selection: dict[str, Any]) -> dict[str, Any]:
     return {} if target is None else {"target": target}
 
 
+def _sorted_refs(
+    refs: Iterable[KubernetesObjectRef],
+) -> tuple[KubernetesObjectRef, ...]:
+    return tuple(sorted(refs, key=_object_ref_sort_key))
+
+
+def _object_ref_sort_key(ref: KubernetesObjectRef) -> tuple[str, str, str]:
+    return (ref.kind, ref.namespace or "", ref.name)
+
+
+def _format_ref(ref: KubernetesObjectRef) -> str:
+    if ref.namespace is None:
+        return f"{ref.kind}/{ref.name}"
+    return f"{ref.kind}/{ref.namespace}/{ref.name}"
+
+
+def object_ref_payloads(
+    refs: Iterable[KubernetesObjectRef],
+) -> list[dict[str, str | None]]:
+    """Describe Kubernetes objects for a progress event or an API response.
+
+    Namespace is null for cluster-scoped objects, which is how manifest-builder
+    reports them and what tells the two kinds of object apart.
+    """
+    return [
+        {"kind": ref.kind, "namespace": ref.namespace, "name": ref.name} for ref in refs
+    ]
+
+
+def _changed_objects_message(
+    output: OutputSettings,
+    created_or_modified: Sequence[KubernetesObjectRef],
+    removed: Sequence[KubernetesObjectRef],
+    deploy_id: str | None,
+) -> str:
+    parts = []
+    if created_or_modified:
+        parts.append(
+            "created or modified "
+            + ", ".join(_format_ref(ref) for ref in created_or_modified)
+        )
+    if removed:
+        parts.append("removed " + ", ".join(_format_ref(ref) for ref in removed))
+    cluster = f" in cluster {output.cluster}" if output.cluster else ""
+    return (
+        f"output {output.name}{cluster} {'; '.join(parts)} "
+        f"(deploy-id {deploy_id or '<none>'})"
+    )
+
+
 def _start_deployment_detection(
     generation_result: GenerationResult,
     deploy_id: str | None,
+    cluster: ClusterSettings | None,
     detector: DeploymentDetector | None,
 ) -> None:
     if deploy_id is None:
@@ -792,8 +909,9 @@ def _start_deployment_detection(
     created_or_modified = set(generation_result.created_or_modified)
     removed = set(generation_result.removed)
     logger.info(
-        "starting deployment detection for manifest-builder deploy-id %s",
+        "starting deployment detection for manifest-builder deploy-id %s in cluster %s",
         deploy_id,
+        cluster.name if cluster is not None else "<injected detector>",
     )
     thread = threading.Thread(
         target=_run_deployment_detection,
@@ -802,6 +920,7 @@ def _start_deployment_detection(
             "deploy_id": deploy_id,
             "created_or_modified": created_or_modified,
             "removed": removed,
+            "cluster": cluster,
             "detector": detector,
         },
         daemon=True,
@@ -814,14 +933,35 @@ def _run_deployment_detection(
     deploy_id: str,
     created_or_modified: set[Any],
     removed: set[Any],
+    cluster: ClusterSettings | None,
     detector: DeploymentDetector | None,
 ) -> None:
-    owned_detector = KubernetesDeploymentDetector() if detector is None else None
-    active_detector = owned_detector if owned_detector is not None else detector
+    owned_detector: KubernetesDeploymentDetector | None = None
+    if detector is None:
+        if cluster is None:
+            logger.error(
+                "deployment detection failed for manifest-builder deploy-id %s: "
+                "no cluster and no detector to observe it with",
+                deploy_id,
+            )
+            return
+        try:
+            owned_detector = KubernetesDeploymentDetector.for_cluster(cluster)
+        except Exception:
+            logger.exception(
+                "deployment detection failed for manifest-builder deploy-id %s: "
+                "could not connect to cluster %s",
+                deploy_id,
+                cluster.name,
+            )
+            return
+    active_detector: DeploymentDetector | None = (
+        owned_detector if owned_detector is not None else detector
+    )
     if active_detector is None:
         logger.error(
             "deployment detection failed for manifest-builder deploy-id %s: "
-            "deployment detector is not configured",
+            "no detector",
             deploy_id,
         )
         return

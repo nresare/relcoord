@@ -29,6 +29,7 @@ from relcoord.change import (
     GitTransportError,
     ProgressSink,
     ignore_progress,
+    object_ref_payloads,
 )
 from relcoord.errors import (
     PersistenceUnavailableError,
@@ -719,7 +720,22 @@ def _comment_payload(comment: object) -> dict[str, Any] | None:
 
 def _change_result_payload(result: object) -> dict[str, Any]:
     generated_count = getattr(result, "generated_count", None)
-    return {"generated": generated_count}
+    return {
+        "generated": generated_count,
+        "outputs": [
+            {
+                "name": output.name,
+                "repository": output.repository,
+                "directory": str(output.directory),
+                "generated": output.generated_count,
+                "cluster": output.cluster,
+                "deploy_id": output.deploy_id,
+                "created_or_modified": object_ref_payloads(output.created_or_modified),
+                "removed": object_ref_payloads(output.removed),
+            }
+            for output in getattr(result, "outputs", ())
+        ],
+    }
 
 
 def _change_completion(plan: _ChangePlan, result: object) -> dict[str, Any]:
