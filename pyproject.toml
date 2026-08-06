@@ -39,6 +39,7 @@ url = "https://repo.noa.re/"
 
 [project.scripts]
 relcoord = "relcoord.main:main"
+relcoord-eks-kubeconfig = "relcoord.eks:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/relcoord"]
