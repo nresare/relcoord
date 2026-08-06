@@ -355,7 +355,7 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
         "config_repo": "acme/config",
         "commit": "deadbeef",
         "registered": None,
-        "processed": {"generated": 0},
+        "processed": {"generated": 0, "outputs": []},
     }
     assert (
         "change processing disabled: no manifests_repository configured; skipping "
@@ -412,7 +412,7 @@ def test_change_processes_deploy_config_when_processor_is_configured(
         "config_repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
         "registered": None,
-        "processed": {"generated": 3},
+        "processed": {"generated": 3, "outputs": []},
     }
     assert (
         "Processing change for repo https://github.com/acme/config.git at commit "
@@ -1147,7 +1147,7 @@ def test_change_streams_progress_when_client_accepts_event_stream() -> None:
         "config_repo": "acme/config",
         "commit": "deadbeef",
         "registered": registered,
-        "processed": {"generated": 2},
+        "processed": {"generated": 2, "outputs": []},
     }
 
 
@@ -1379,7 +1379,7 @@ def test_change_returns_json_when_event_stream_is_not_accepted() -> None:
         "config_repo": "acme/config",
         "commit": "deadbeef",
         "registered": None,
-        "processed": {"generated": 1},
+        "processed": {"generated": 1, "outputs": []},
     }
 
 

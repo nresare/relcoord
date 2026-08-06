@@ -90,6 +90,7 @@ def make_change_processor(
     return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
         outputs=settings.outputs,
+        clusters=settings.clusters,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
     )

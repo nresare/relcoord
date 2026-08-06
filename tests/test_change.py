@@ -19,7 +19,7 @@ from relcoord.change import (
     DeploymentDetectionError,
     GitTransportError,
 )
-from relcoord.config import OutputSettings
+from relcoord.config import ClusterSettings, OutputSettings
 from relcoord.git import GitCredentialError
 
 
@@ -215,11 +215,26 @@ def test_change_processor_reports_progress_for_each_step(
         "manifests-checkout",
         "generate",
         "generated",
+        "changed-objects",
         "commit",
         "push",
         "pushed",
     ]
     by_phase = {event.phase: event for event in events}
+    assert by_phase["changed-objects"].detail == {
+        "output": "manifests",
+        "repository": "https://github.com/acme/manifests.git",
+        "cluster": None,
+        "deploy_id": "0123456789abcdef",
+        "created_or_modified": [
+            {"kind": "Deployment", "namespace": "config", "name": "api"}
+        ],
+        "removed": [],
+    }
+    assert by_phase["changed-objects"].message == (
+        "output manifests created or modified Deployment/config/api "
+        "(deploy-id 0123456789abcdef)"
+    )
     assert by_phase["source-checkout"].detail == {
         "repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
@@ -1018,3 +1033,172 @@ def test_credentials_for_wraps_git_credential_error_with_operation_context(
     assert "checking out source repo https://github.com/acme/system.git" in message
     assert "idcat returned HTTP 401: not allowed" in message
     assert isinstance(excinfo.value.__cause__, GitCredentialError)
+
+
+def test_change_processor_reports_the_objects_a_change_touched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = {
+        Ref(kind="Deployment", namespace="config", name="api"),
+        Ref(kind="Namespace", namespace=None, name="config"),
+    }
+    removed = {Ref(kind="ConfigMap", namespace="config", name="old-api")}
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        return GenerationResult(
+            written_paths={args[1] / "api.yaml"},
+            created_or_modified=created,
+            removed=removed,
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
+
+    result = ChangeProcessor(
+        outputs=[
+            OutputSettings(
+                name="example-dev",
+                repository="https://github.com/acme/manifests.git",
+                directory=Path("example-dev"),
+                cluster="example-dev",
+            )
+        ],
+        clusters=[
+            ClusterSettings(
+                name="example-dev",
+                api_endpoint="https://example.eks.amazonaws.com",
+                ca_path=Path("/ca.pem"),
+            )
+        ],
+    ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+    output = result.outputs[0]
+    assert output.cluster == "example-dev"
+    assert output.deploy_id == "0123456789abcdef"
+    # Sorted by kind, then namespace, then name, so the report is stable.
+    assert output.created_or_modified == (
+        Ref(kind="Deployment", namespace="config", name="api"),
+        Ref(kind="Namespace", namespace=None, name="config"),
+    )
+    assert output.removed == (
+        Ref(kind="ConfigMap", namespace="config", name="old-api"),
+    )
+
+
+def test_change_processor_detects_deployment_in_the_output_cluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = {Ref(kind="Deployment", namespace="config", name="api")}
+    detected = threading.Event()
+    observed: dict[str, object] = {}
+
+    class Detector:
+        def __init__(self, cluster: ClusterSettings) -> None:
+            self.cluster = cluster
+
+        def wait_for_success(self, **kwargs) -> None:
+            observed.update(kwargs)
+            observed["cluster"] = self.cluster.name
+            detected.set()
+
+        def close(self) -> None:
+            observed["closed"] = True
+
+    def fake_for_cluster(cluster: ClusterSettings, **kwargs) -> Detector:
+        return Detector(cluster)
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        return GenerationResult(
+            written_paths={args[1] / "api.yaml"},
+            created_or_modified=created,
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
+    monkeypatch.setattr(
+        change.KubernetesDeploymentDetector, "for_cluster", fake_for_cluster
+    )
+
+    ChangeProcessor(
+        outputs=[
+            OutputSettings(
+                name="example-dev",
+                repository="https://github.com/acme/manifests.git",
+                directory=Path("example-dev"),
+                cluster="example-dev",
+            )
+        ],
+        clusters=[
+            ClusterSettings(
+                name="example-dev",
+                api_endpoint="https://example.eks.amazonaws.com",
+                ca_path=Path("/ca.pem"),
+            )
+        ],
+        detect_deployment=True,
+    ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert detected.wait(timeout=1)
+    assert observed["cluster"] == "example-dev"
+    assert observed["deploy_id"] == "0123456789abcdef"
+    assert observed["created_or_modified"] == created
+
+
+def test_change_processor_rejects_detection_without_a_cluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        target.mkdir(parents=True)
+
+    def fake_generate(*args, **kwargs) -> GenerationResult:
+        return GenerationResult(
+            written_paths={args[1] / "api.yaml"},
+            created_or_modified={Ref(kind="Deployment", namespace="c", name="api")},
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
+
+    with pytest.raises(DeploymentDetectionError, match="does not name a cluster"):
+        ChangeProcessor(
+            "https://github.com/acme/manifests.git",
+            detect_deployment=True,
+        ).process("https://github.com/acme/config.git", "deadbeef", None)

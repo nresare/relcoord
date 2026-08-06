@@ -12,16 +12,23 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
+import time
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
 import boto3
 import click
+import httpx
 import yaml
 from botocore.signers import RequestSigner
 
 TOKEN_PREFIX = "k8s-aws-v1."
 TOKEN_LIFETIME_MINUTES = 15
+# A token stays valid for TOKEN_LIFETIME_MINUTES; signing a new one is cheap and
+# entirely local, so a long-lived client replaces its token well before then.
+TOKEN_REFRESH_SECONDS = 600.0
 DEFAULT_KUBECONFIG = Path.home() / ".kube" / "config"
 
 
@@ -65,6 +72,48 @@ def cluster_token(session: boto3.Session, cluster_name: str) -> str:
     )
     encoded = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
     return TOKEN_PREFIX + encoded
+
+
+class EksTokenAuth(httpx.Auth):
+    """Authenticates every request with a current EKS token.
+
+    Signing is local, so this holds no long-lived state beyond the AWS session
+    and re-signs once a token has aged past ``refresh_after_seconds``. Clients
+    are shared between threads, so the cached token is guarded by a lock.
+    """
+
+    def __init__(
+        self,
+        session: boto3.Session,
+        cluster_name: str,
+        *,
+        refresh_after_seconds: float = TOKEN_REFRESH_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._session = session
+        self._cluster_name = cluster_name
+        self._refresh_after_seconds = refresh_after_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._token: str | None = None
+        self._signed_at = 0.0
+
+    def token(self) -> str:
+        with self._lock:
+            now = self._clock()
+            if (
+                self._token is None
+                or now - self._signed_at >= self._refresh_after_seconds
+            ):
+                self._token = cluster_token(self._session, self._cluster_name)
+                self._signed_at = now
+            return self._token
+
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> Generator[httpx.Request, httpx.Response]:
+        request.headers["Authorization"] = f"Bearer {self.token()}"
+        yield request
 
 
 def kubeconfig_path() -> Path:

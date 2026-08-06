@@ -418,11 +418,26 @@ def test_settings_rejects_manifests_repository_and_outputs(tmp_path: Path) -> No
 
 def test_settings_parses_detect_deployment(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
-    config.write_text("detect-deployment = true\n")
+    config.write_text(
+        """
+        detect-deployment = true
+
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        cluster = "example-dev"
+
+        [[cluster]]
+        name = "example-dev"
+        api-endpoint = "https://example.eks.amazonaws.com"
+        ca-path = "/etc/relcoord/example-dev-ca.pem"
+        """
+    )
 
     settings = Settings.from_toml(config)
 
     assert settings.detect_deployment is True
+    assert settings.outputs[0].cluster == "example-dev"
 
 
 def test_settings_defaults_detect_deployment_to_false(tmp_path: Path) -> None:
@@ -656,4 +671,133 @@ def test_settings_rejects_persistence_without_idmouse(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="persistence.idmouse must be configured"):
+        Settings.from_toml(config)
+
+
+def test_settings_parses_clusters(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[cluster]]
+        name = "example-dev"
+        api-endpoint = "https://example.eks.amazonaws.com"
+        ca-path = "/etc/relcoord/example-dev-ca.pem"
+        region = "eu-west-1"
+        eks-cluster-name = "example-dev-eks"
+
+        [[cluster]]
+        name = "example-prod"
+        api-endpoint = "https://prod.eks.amazonaws.com"
+        ca-path = "/etc/relcoord/example-prod-ca.pem"
+        """
+    )
+
+    settings = Settings.from_toml(config)
+
+    dev, prod = settings.clusters
+    assert dev.api_endpoint == "https://example.eks.amazonaws.com"
+    assert dev.ca_path == Path("/etc/relcoord/example-dev-ca.pem")
+    assert dev.region == "eu-west-1"
+    assert dev.eks_name == "example-dev-eks"
+    assert prod.region is None
+    # A cluster that does not say otherwise is called the same thing in EKS.
+    assert prod.eks_name == "example-prod"
+
+
+def test_settings_rejects_duplicate_clusters(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[cluster]]
+        name = "example-dev"
+        api-endpoint = "https://example.eks.amazonaws.com"
+        ca-path = "/ca.pem"
+
+        [[cluster]]
+        name = "example-dev"
+        api-endpoint = "https://other.eks.amazonaws.com"
+        ca-path = "/ca.pem"
+        """
+    )
+
+    with pytest.raises(ValueError, match="duplicate cluster 'example-dev'"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_a_cluster_without_an_api_endpoint(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[cluster]]
+        name = "example-dev"
+        ca-path = "/ca.pem"
+        """
+    )
+
+    with pytest.raises(ValueError, match="cluster.api-endpoint must be"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_an_output_naming_an_unconfigured_cluster(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        cluster = "missing"
+
+        [[cluster]]
+        name = "example-dev"
+        api-endpoint = "https://example.eks.amazonaws.com"
+        ca-path = "/ca.pem"
+        """
+    )
+
+    with pytest.raises(ValueError, match="expected one of example-dev"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_detect_deployment_without_a_cluster_per_output(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        detect-deployment = true
+
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        cluster = "example-dev"
+
+        [[output]]
+        name = "example-prod"
+        repository = "https://github.com/acme/manifests"
+
+        [[cluster]]
+        name = "example-dev"
+        api-endpoint = "https://example.eks.amazonaws.com"
+        ca-path = "/ca.pem"
+        """
+    )
+
+    with pytest.raises(ValueError, match="every output to name a cluster"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_detect_deployment_with_manifests_repository(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        detect-deployment = true
+        manifests-repository = "https://github.com/acme/manifests"
+        """
+    )
+
+    with pytest.raises(ValueError, match="detect-deployment requires"):
         Settings.from_toml(config)

@@ -15,6 +15,11 @@ diff-output = "example-dev"
 name = "example-dev"
 repository = "https://github.com/example/manifests"
 directory = "example-dev"
+# The cluster these manifests are deployed to, named after a [[cluster]] entry
+# below. Deployment detection watches that cluster for the objects this output's
+# manifests describe, so detect-deployment = true requires every output to name
+# one.
+cluster = "example-dev"
 
 [output.vars]
 cluster_name = "example-dev"
@@ -31,11 +36,42 @@ name = "example-prod"
 repository = "https://github.com/example/manifests"
 directory = "example-prod"
 target = "prod"
+cluster = "example-prod"
 
 [output.vars]
 cluster_name = "example-prod"
 account_id = 444455556666
 issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEPRODCLUSTERID"
+
+# Clusters relcoord watches a change materialise in. Each entry is an EKS
+# cluster reached with the ambient AWS credentials: relcoord signs a presigned
+# STS GetCallerIdentity URL as its own identity, so the cluster needs an access
+# entry for relcoord's IAM role, and that role may live in another account.
+#
+# The API endpoint and CA certificate are configured rather than looked up
+# because eks:DescribeCluster only resolves clusters in the caller's own
+# account. Both are printed by, in the cluster's own account:
+#
+#   aws eks describe-cluster --name example-dev \
+#     --query 'cluster.{endpoint:endpoint,ca:certificateAuthority.data}'
+#
+# The CA is base64 in that output; ca-path points at the decoded PEM.
+[[cluster]]
+name = "example-dev"
+api-endpoint = "https://EXAMPLEDEVCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
+ca-path = "/etc/relcoord/example-dev-ca.pem"
+# Region to sign the token in. Defaults to the region of relcoord's own AWS
+# session, which is usually but not always the cluster's region.
+region = "eu-west-1"
+# The name EKS knows this cluster by, which the token is bound to. Defaults to
+# the name above.
+eks-cluster-name = "example-dev"
+
+[[cluster]]
+name = "example-prod"
+api-endpoint = "https://EXAMPLEPRODCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
+ca-path = "/etc/relcoord/example-prod-ca.pem"
+region = "eu-west-1"
 
 [persistence]
 backend = "surrealdb"
