@@ -29,9 +29,13 @@ dev = [
   "pytest",
   "ty",
   "ruff",
+  "bktools",
   "httpx2>=2.4.0",
 ]
 
+
+[[tool.uv.index]]
+url = "https://repo.noa.re/"
 
 [project.scripts]
 relcoord = "relcoord.main:main"
