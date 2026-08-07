@@ -103,19 +103,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bktools"
-version = "0.3.0.post9+g0990a48c1"
-source = { registry = "https://repo.noa.re/" }
-dependencies = [
-    { name = "click" },
-    { name = "manifest-builder" },
-    { name = "pyyaml" },
-]
-wheels = [
-    { url = "https://repo.noa.re/bktools/bktools-0.3.0.post9%2Bg0990a48c1-py3-none-any.whl", hash = "sha256:8aba5fbb83cdd882c2f8738e8746912fc25450685c7424186de588073980cade", size = 22858 },
-]
-
-[[package]]
 name = "boto3"
 version = "1.43.65"
 source = { registry = "https://pypi.org/simple" }
@@ -524,8 +511,8 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.7.1"
-source = { registry = "https://repo.noa.re/" }
+version = "0.7.2"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "dulwich" },
@@ -533,7 +520,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.7.1-py3-none-any.whl", hash = "sha256:2afbe6df9bf2b34a42452d5e54d41765c8cd3ad501608d3b153e21194445c5b0", size = 44006 },
+    { url = "https://files.pythonhosted.org/packages/13/b2/264640bafb1c61db3dbf8af8d6347c7b59a9ae429e67b126acde8319b5e8/manifest_builder-0.7.2-py3-none-any.whl", hash = "sha256:f85de3cc97dd1b77761d103422e4257219f8485fb20eb631eb8753288eb3fd61", size = 43918, upload-time = "2026-08-05T21:33:53.019Z" },
 ]
 
 [[package]]
@@ -837,7 +824,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "bktools" },
     { name = "httpx" },
     { name = "httpx2" },
     { name = "pytest" },
@@ -861,7 +847,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "bktools" },
     { name = "httpx" },
     { name = "httpx2", specifier = ">=2.4.0" },
     { name = "pytest" },
