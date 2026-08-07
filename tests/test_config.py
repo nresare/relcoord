@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from relcoord.auth import KUBERNETES_CA_CERT_PATH, KUBERNETES_SERVICE_HOST
 from relcoord.config import Settings
 
 
@@ -425,10 +426,7 @@ def test_settings_parses_detect_deployment(tmp_path: Path) -> None:
         [[output]]
         name = "example-dev"
         repository = "https://github.com/acme/manifests"
-        cluster = "example-dev"
-
-        [[cluster]]
-        name = "example-dev"
+        connection-type = "eks"
         api-endpoint = "https://example.eks.amazonaws.com"
         ca-path = "/etc/relcoord/example-dev-ca.pem"
         """
@@ -437,7 +435,7 @@ def test_settings_parses_detect_deployment(tmp_path: Path) -> None:
     settings = Settings.from_toml(config)
 
     assert settings.detect_deployment is True
-    assert settings.outputs[0].cluster == "example-dev"
+    assert settings.outputs[0].connection_type == "eks"
 
 
 def test_settings_defaults_detect_deployment_to_false(tmp_path: Path) -> None:
@@ -674,71 +672,68 @@ def test_settings_rejects_persistence_without_idmouse(tmp_path: Path) -> None:
         Settings.from_toml(config)
 
 
-def test_settings_parses_clusters(tmp_path: Path) -> None:
+def test_settings_parses_an_eks_connection_on_an_output(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
         """
-        [[cluster]]
+        [[output]]
         name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        connection-type = "eks"
         api-endpoint = "https://example.eks.amazonaws.com"
         ca-path = "/etc/relcoord/example-dev-ca.pem"
         region = "eu-west-1"
         eks-cluster-name = "example-dev-eks"
-
-        [[cluster]]
-        name = "example-prod"
-        api-endpoint = "https://prod.eks.amazonaws.com"
-        ca-path = "/etc/relcoord/example-prod-ca.pem"
         """
     )
 
-    settings = Settings.from_toml(config)
+    output = Settings.from_toml(config).outputs[0]
 
-    dev, prod = settings.clusters
-    assert dev.api_endpoint == "https://example.eks.amazonaws.com"
-    assert dev.ca_path == Path("/etc/relcoord/example-dev-ca.pem")
-    assert dev.region == "eu-west-1"
-    assert dev.eks_name == "example-dev-eks"
-    assert prod.region is None
-    # A cluster that does not say otherwise is called the same thing in EKS.
-    assert prod.eks_name == "example-prod"
+    assert output.connection_type == "eks"
+    assert output.api_endpoint == "https://example.eks.amazonaws.com"
+    assert output.ca_path == Path("/etc/relcoord/example-dev-ca.pem")
+    assert output.region == "eu-west-1"
+    assert output.eks_name == "example-dev-eks"
 
 
-def test_settings_rejects_duplicate_clusters(tmp_path: Path) -> None:
+def test_settings_parses_a_local_connection_with_in_cluster_defaults(
+    tmp_path: Path,
+) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
         """
-        [[cluster]]
-        name = "example-dev"
-        api-endpoint = "https://example.eks.amazonaws.com"
-        ca-path = "/ca.pem"
-
-        [[cluster]]
-        name = "example-dev"
-        api-endpoint = "https://other.eks.amazonaws.com"
-        ca-path = "/ca.pem"
+        [[output]]
+        name = "local"
+        repository = "https://github.com/acme/manifests"
+        connection-type = "local"
         """
     )
 
-    with pytest.raises(ValueError, match="duplicate cluster 'example-dev'"):
-        Settings.from_toml(config)
+    output = Settings.from_toml(config).outputs[0]
+
+    assert output.connection_type == "local"
+    assert output.api_endpoint == KUBERNETES_SERVICE_HOST
+    assert output.ca_path == KUBERNETES_CA_CERT_PATH
 
 
-def test_settings_rejects_a_cluster_without_an_api_endpoint(tmp_path: Path) -> None:
+def test_settings_rejects_an_unknown_output_connection_type(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
         """
-        [[cluster]]
+        [[output]]
         name = "example-dev"
-        ca-path = "/ca.pem"
+        repository = "https://github.com/acme/manifests"
+        connection-type = "kubeconfig"
         """
     )
 
-    with pytest.raises(ValueError, match="cluster.api-endpoint must be"):
+    with pytest.raises(
+        ValueError, match="output.connection-type must be 'eks' or 'local'"
+    ):
         Settings.from_toml(config)
 
 
-def test_settings_rejects_an_output_naming_an_unconfigured_cluster(
+def test_settings_requires_connection_type_with_connection_properties(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "relcoord.toml"
@@ -747,20 +742,65 @@ def test_settings_rejects_an_output_naming_an_unconfigured_cluster(
         [[output]]
         name = "example-dev"
         repository = "https://github.com/acme/manifests"
-        cluster = "missing"
-
-        [[cluster]]
-        name = "example-dev"
         api-endpoint = "https://example.eks.amazonaws.com"
         ca-path = "/ca.pem"
         """
     )
 
-    with pytest.raises(ValueError, match="expected one of example-dev"):
+    with pytest.raises(ValueError, match="output.connection-type must be set"):
         Settings.from_toml(config)
 
 
-def test_settings_rejects_detect_deployment_without_a_cluster_per_output(
+def test_settings_rejects_an_eks_output_without_an_api_endpoint(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        connection-type = "eks"
+        ca-path = "/ca.pem"
+        """
+    )
+
+    with pytest.raises(ValueError, match="output.api-endpoint must be"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_a_standalone_cluster_block(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[cluster]]
+        name = "example-dev"
+        connection-type = "eks"
+        api-endpoint = "https://example.eks.amazonaws.com"
+        ca-path = "/ca.pem"
+        """
+    )
+
+    with pytest.raises(ValueError, match=r"\[\[cluster\]\] entries are not supported"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_an_output_cluster_reference(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        cluster = "example-dev"
+        """
+    )
+
+    with pytest.raises(ValueError, match="output.cluster is not supported"):
+        Settings.from_toml(config)
+
+
+def test_settings_rejects_detect_deployment_without_connection_type_per_output(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "relcoord.toml"
@@ -771,20 +811,15 @@ def test_settings_rejects_detect_deployment_without_a_cluster_per_output(
         [[output]]
         name = "example-dev"
         repository = "https://github.com/acme/manifests"
-        cluster = "example-dev"
+        connection-type = "local"
 
         [[output]]
         name = "example-prod"
         repository = "https://github.com/acme/manifests"
-
-        [[cluster]]
-        name = "example-dev"
-        api-endpoint = "https://example.eks.amazonaws.com"
-        ca-path = "/ca.pem"
         """
     )
 
-    with pytest.raises(ValueError, match="every output to name a cluster"):
+    with pytest.raises(ValueError, match="every output to set connection-type"):
         Settings.from_toml(config)
 
 
