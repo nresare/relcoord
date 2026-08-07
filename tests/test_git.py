@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 from dulwich import porcelain
+from dulwich.config import StackedConfig
 
 from relcoord.config import IdcatSettings
 from relcoord.git import (
@@ -34,7 +35,6 @@ def test_clone_repository_uses_python_git_implementation(tmp_path: Path) -> None
         message=b"initial",
         author=b"Relcoord <relcoord@example.com>",
         committer=b"Relcoord <relcoord@example.com>",
-        sign=False,
     ).decode("ascii")
     repo.close()
 
@@ -43,6 +43,18 @@ def test_clone_repository_uses_python_git_implementation(tmp_path: Path) -> None
     assert result.source == str(source)
     assert result.head == commit
     assert (Path(result.path) / "README.md").read_text() == "hello from dulwich\n"
+
+
+def test_the_tests_do_not_inherit_a_signing_git_config() -> None:
+    """Guards the conftest fixture that keeps the developer's config out.
+
+    dulwich signs the commits the tests make if the config it finds says to,
+    which on a developer's machine means gpg-agent asking for a passphrase and
+    a hardware key in the middle of a test run.
+    """
+    config = StackedConfig(StackedConfig.default_backends())
+
+    assert not config.get_boolean((b"commit",), b"gpgsign", default=False)
 
 
 def test_clone_repository_uses_shallow_clone() -> None:
