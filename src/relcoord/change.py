@@ -23,7 +23,7 @@ from manifest_builder.config import (
     load_toml_file,
 )
 
-from relcoord.config import ClusterSettings, IdcatSettings, OutputSettings
+from relcoord.config import IdcatSettings, OutputSettings
 from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
 from relcoord.github import GithubCommentError, GithubIssueCommenter, IssueCommenter
 from relcoord.kubernetes import KubernetesDeploymentDetector, KubernetesObjectRef
@@ -149,7 +149,6 @@ class OutputResult:
 class ChangeProcessor:
     manifests_repository: str | None = None
     outputs: Sequence[OutputSettings] = ()
-    clusters: Sequence[ClusterSettings] = ()
     idcat: IdcatSettings | None = None
     detect_deployment: bool = False
     deployment_detector: DeploymentDetector | None = None
@@ -289,7 +288,7 @@ class ChangeProcessor:
                             message,
                             output=output.name,
                             repository=repository,
-                            cluster=output.cluster,
+                            cluster=_cluster_name(output),
                             deploy_id=deploy_id,
                             created_or_modified=object_ref_payloads(
                                 created_or_modified
@@ -304,7 +303,7 @@ class ChangeProcessor:
                             manifests_checkout=manifests_checkout,
                             generated_count=len(generated),
                             deploy_id=deploy_id,
-                            cluster=output.cluster,
+                            cluster=_cluster_name(output),
                             created_or_modified=created_or_modified,
                             removed=removed_refs,
                         )
@@ -361,19 +360,19 @@ class ChangeProcessor:
                 if self.detect_deployment:
                     for output, generation_result in detection_results:
                         deploy_id = _deploy_id(generation_result)
-                        cluster = self._cluster_for(output)
+                        connection = self._connection_for(output)
                         report(
                             "deployment-detection",
                             "waiting for deployment of manifest-builder deploy-id "
-                            f"{deploy_id} in cluster {output.cluster}",
+                            f"{deploy_id} in cluster {output.name}",
                             deploy_id=deploy_id,
                             output=output.name,
-                            cluster=output.cluster,
+                            cluster=output.name,
                         )
                         _start_deployment_detection(
                             generation_result,
                             deploy_id,
-                            cluster,
+                            connection,
                             self.deployment_detector,
                         )
             return ChangeResult(
@@ -395,28 +394,21 @@ class ChangeProcessor:
     def _configured_outputs(self) -> tuple[OutputSettings, ...]:
         return _resolve_output_settings(self.outputs, self.manifests_repository)
 
-    def _cluster_for(self, output: OutputSettings) -> ClusterSettings | None:
-        """Return the cluster an output's manifests are deployed to.
+    def _connection_for(self, output: OutputSettings) -> OutputSettings | None:
+        """Return the connection for an output's deployment destination.
 
         None where an injected detector stands in for a real cluster, which is
         how tests and callers that supply their own connection work; a
         configuration reaching detection without either is a bug rather than
         something a change request can cause, since config loading rejects it.
         """
-        if output.cluster is None:
+        if output.connection_type is None:
             if self.deployment_detector is not None:
                 return None
             raise DeploymentDetectionError(
-                f"output {output.name} does not name a cluster to detect its "
-                "deployment in"
+                f"output {output.name} has no connection-type for deployment detection"
             )
-        for cluster in self.clusters:
-            if cluster.name == output.cluster:
-                return cluster
-        raise DeploymentDetectionError(
-            f"output {output.name} names cluster {output.cluster}, which is not "
-            "configured"
-        )
+        return output
 
 
 @dataclass(frozen=True)
@@ -888,17 +880,22 @@ def _changed_objects_message(
         )
     if removed:
         parts.append("removed " + ", ".join(_format_ref(ref) for ref in removed))
-    cluster = f" in cluster {output.cluster}" if output.cluster else ""
+    cluster_name = _cluster_name(output)
+    cluster = f" in cluster {cluster_name}" if cluster_name else ""
     return (
         f"output {output.name}{cluster} {'; '.join(parts)} "
         f"(deploy-id {deploy_id or '<none>'})"
     )
 
 
+def _cluster_name(output: OutputSettings) -> str | None:
+    return output.name if output.connection_type is not None else None
+
+
 def _start_deployment_detection(
     generation_result: GenerationResult,
     deploy_id: str | None,
-    cluster: ClusterSettings | None,
+    connection: OutputSettings | None,
     detector: DeploymentDetector | None,
 ) -> None:
     if deploy_id is None:
@@ -911,7 +908,7 @@ def _start_deployment_detection(
     logger.info(
         "starting deployment detection for manifest-builder deploy-id %s in cluster %s",
         deploy_id,
-        cluster.name if cluster is not None else "<injected detector>",
+        connection.name if connection is not None else "<injected detector>",
     )
     thread = threading.Thread(
         target=_run_deployment_detection,
@@ -920,7 +917,7 @@ def _start_deployment_detection(
             "deploy_id": deploy_id,
             "created_or_modified": created_or_modified,
             "removed": removed,
-            "cluster": cluster,
+            "connection": connection,
             "detector": detector,
         },
         daemon=True,
@@ -933,12 +930,12 @@ def _run_deployment_detection(
     deploy_id: str,
     created_or_modified: set[Any],
     removed: set[Any],
-    cluster: ClusterSettings | None,
+    connection: OutputSettings | None,
     detector: DeploymentDetector | None,
 ) -> None:
     owned_detector: KubernetesDeploymentDetector | None = None
     if detector is None:
-        if cluster is None:
+        if connection is None:
             logger.error(
                 "deployment detection failed for manifest-builder deploy-id %s: "
                 "no cluster and no detector to observe it with",
@@ -946,13 +943,13 @@ def _run_deployment_detection(
             )
             return
         try:
-            owned_detector = KubernetesDeploymentDetector.for_cluster(cluster)
+            owned_detector = KubernetesDeploymentDetector.for_output(connection)
         except Exception:
             logger.exception(
                 "deployment detection failed for manifest-builder deploy-id %s: "
                 "could not connect to cluster %s",
                 deploy_id,
-                cluster.name,
+                connection.name,
             )
             return
     active_detector: DeploymentDetector | None = (

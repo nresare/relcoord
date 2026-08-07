@@ -8,11 +8,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from relcoord.auth import RoleConfig
+from relcoord.auth import (
+    KUBERNETES_CA_CERT_PATH,
+    KUBERNETES_SERVICE_HOST,
+    RoleConfig,
+)
 
 logger = logging.getLogger(__name__)
 
 TemplateValue = str | int | float | bool
+ConnectionType = Literal["eks", "local"]
 
 
 def _read_secret_file(path: Path) -> str:
@@ -133,41 +138,6 @@ class IdcatSettings:
 
 
 @dataclass(frozen=True)
-class ClusterSettings:
-    """One Kubernetes cluster relcoord can watch a change materialise in.
-
-    The API endpoint and CA certificate are configured rather than looked up
-    because eks:DescribeCluster only resolves clusters in the caller's own
-    account, and the clusters relcoord deploys to are generally elsewhere.
-    """
-
-    name: str
-    api_endpoint: str
-    ca_path: Path
-    region: str | None = None
-    eks_cluster_name: str | None = None
-
-    @property
-    def eks_name(self) -> str:
-        """The cluster name EKS knows, which the token is bound to.
-
-        Cluster entries are named for relcoord's own configuration, which is
-        usually but not always what the cluster is called in EKS.
-        """
-        return self.name if self.eks_cluster_name is None else self.eks_cluster_name
-
-    @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> ClusterSettings:
-        return cls(
-            name=_required_cluster_string(data, "name"),
-            api_endpoint=_required_cluster_string(data, "api-endpoint"),
-            ca_path=Path(_required_cluster_string(data, "ca-path")),
-            region=_optional_cluster_string(data, "region"),
-            eks_cluster_name=_optional_cluster_string(data, "eks-cluster-name"),
-        )
-
-
-@dataclass(frozen=True)
 class OutputSettings:
     """One manifests destination, and what manifest-builder generates into it.
 
@@ -185,7 +155,16 @@ class OutputSettings:
     directory: Path
     vars: dict[str, TemplateValue] = field(default_factory=dict)
     target: str | None = None
-    cluster: str | None = None
+    connection_type: ConnectionType | None = None
+    api_endpoint: str | None = None
+    ca_path: Path | None = None
+    region: str | None = None
+    eks_cluster_name: str | None = None
+
+    @property
+    def eks_name(self) -> str:
+        """The EKS name used to bind an authentication token."""
+        return self.name if self.eks_cluster_name is None else self.eks_cluster_name
 
     @property
     def target_name(self) -> str:
@@ -202,16 +181,38 @@ class OutputSettings:
         name = _required_output_string(data, "name")
         repository = _required_output_string(data, "repository")
         directory = _required_output_directory(data)
+        if "cluster" in data:
+            raise ValueError(
+                "output.cluster is not supported; put the connection settings "
+                "directly in the output"
+            )
         raw_vars = data.get("vars", {})
         if not isinstance(raw_vars, dict):
             raise TypeError("output.vars must be a table")
+        connection_type = _optional_output_connection_type(data)
+        api_endpoint: str | None = None
+        ca_path: str | None = None
+        if connection_type == "eks":
+            api_endpoint = _optional_output_string(data, "api-endpoint")
+            ca_path = _optional_output_string(data, "ca-path")
+            api_endpoint = api_endpoint or _required_output_string(data, "api-endpoint")
+            ca_path = ca_path or _required_output_string(data, "ca-path")
+        elif connection_type == "local":
+            api_endpoint = _optional_output_string(data, "api-endpoint")
+            ca_path = _optional_output_string(data, "ca-path")
+            api_endpoint = api_endpoint or KUBERNETES_SERVICE_HOST
+            ca_path = ca_path or str(KUBERNETES_CA_CERT_PATH)
         return cls(
             name=name,
             repository=repository,
             directory=directory,
             vars=_output_vars(raw_vars),
             target=_optional_output_string(data, "target"),
-            cluster=_optional_output_string(data, "cluster"),
+            connection_type=connection_type,
+            api_endpoint=api_endpoint,
+            ca_path=Path(ca_path) if ca_path is not None else None,
+            region=_optional_output_string(data, "region"),
+            eks_cluster_name=_optional_output_string(data, "eks-cluster-name"),
         )
 
 
@@ -222,7 +223,6 @@ class Settings:
     log_level: str = "INFO"
     manifests_repository: str | None = None
     outputs: list[OutputSettings] = field(default_factory=list)
-    clusters: list[ClusterSettings] = field(default_factory=list)
     diff_output: str | None = None
     detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
@@ -254,10 +254,11 @@ class Settings:
         if not isinstance(raw_outputs, list):
             raise TypeError("output must be an array of tables")
         outputs = _outputs_from_entries(raw_outputs)
-        raw_clusters = data.get("cluster", [])
-        if not isinstance(raw_clusters, list):
-            raise TypeError("cluster must be an array of tables")
-        clusters = _clusters_from_entries(raw_clusters)
+        if "cluster" in data:
+            raise ValueError(
+                "[[cluster]] entries are not supported; put connection settings "
+                "directly in each [[output]]"
+            )
         manifests_repository = _optional_string(data, "manifests-repository")
         if manifests_repository is not None and outputs:
             raise ValueError(
@@ -267,7 +268,7 @@ class Settings:
         detect_deployment = _bool_or_default(
             data, "detect-deployment", cls.detect_deployment
         )
-        _check_output_clusters(outputs, clusters, detect_deployment)
+        _check_deployment_outputs(outputs, detect_deployment)
         roles: list[RoleConfig] = []
         seen: set[str] = set()
         for entry in raw_roles:
@@ -289,7 +290,6 @@ class Settings:
             log_level=_log_level_or_default(data, "log-level", cls.log_level),
             manifests_repository=manifests_repository,
             outputs=outputs,
-            clusters=clusters,
             diff_output=diff_output,
             detect_deployment=detect_deployment,
             persistence=(
@@ -378,68 +378,39 @@ def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:
     return outputs
 
 
-def _clusters_from_entries(entries: list[Any]) -> list[ClusterSettings]:
-    clusters: list[ClusterSettings] = []
-    seen: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise TypeError("each cluster entry must be a table")
-        cluster = ClusterSettings.from_mapping(entry)
-        if cluster.name in seen:
-            raise ValueError(f"duplicate cluster '{cluster.name}'")
-        seen.add(cluster.name)
-        clusters.append(cluster)
-    return clusters
-
-
-def _check_output_clusters(
-    outputs: list[OutputSettings],
-    clusters: list[ClusterSettings],
-    detect_deployment: bool,
+def _check_deployment_outputs(
+    outputs: list[OutputSettings], detect_deployment: bool
 ) -> None:
-    """Check that outputs name a configured cluster, and have one when needed.
-
-    Deployment detection watches the cluster an output's manifests are deployed
-    to, so with detection enabled every output has to say which cluster that is.
-    """
-    configured = {cluster.name for cluster in clusters}
-    for output in outputs:
-        if output.cluster is not None and output.cluster not in configured:
-            expected = ", ".join(sorted(configured))
-            raise ValueError(
-                f"output '{output.name}' names cluster '{output.cluster}', which "
-                "is not configured"
-                + (f"; expected one of {expected}" if expected else "")
-            )
     if not detect_deployment:
         return
     if not outputs:
         raise ValueError(
-            "detect-deployment requires [[output]] entries naming the cluster to "
-            "watch; manifests-repository does not say which cluster its manifests "
-            "are deployed to"
+            "detect-deployment requires [[output]] entries with connection settings; "
+            "manifests-repository does not say which cluster its manifests are "
+            "deployed to"
         )
-    missing = [output.name for output in outputs if output.cluster is None]
+    missing = [output.name for output in outputs if output.connection_type is None]
     if missing:
         raise ValueError(
-            "detect-deployment requires every output to name a cluster; "
+            "detect-deployment requires every output to set connection-type; "
             f"{', '.join(sorted(missing))} does not"
         )
 
 
-def _required_cluster_string(data: dict[str, Any], key: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"cluster.{key} must be a non-empty string")
-    return value
-
-
-def _optional_cluster_string(data: dict[str, Any], key: str) -> str | None:
-    value = data.get(key)
+def _optional_output_connection_type(
+    data: dict[str, Any],
+) -> ConnectionType | None:
+    value = data.get("connection-type")
     if value is None:
+        connection_keys = {"api-endpoint", "ca-path", "region", "eks-cluster-name"}
+        if connection_keys.intersection(data):
+            raise ValueError(
+                "output.connection-type must be set when configuring a cluster "
+                "connection"
+            )
         return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"cluster.{key} must be a non-empty string")
+    if value not in ("eks", "local"):
+        raise ValueError("output.connection-type must be 'eks' or 'local'")
     return value
 
 

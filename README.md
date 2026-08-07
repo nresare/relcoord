@@ -216,8 +216,9 @@ to be gone. Objects are waited for with a list narrowed to the object's name
 followed by a watch, so a rollout is observed as it happens rather than polled
 for.
 
-Each output says which cluster its manifests are deployed to, and each cluster
-is reached with the AWS credentials relcoord itself runs as:
+The connection properties live on the output whose deployment they describe.
+With deployment detection enabled, every output must explicitly set
+`connection-type` to either `eks` or `local`:
 
 ```toml
 detect-deployment = true
@@ -226,21 +227,17 @@ detect-deployment = true
 name = "example-dev"
 repository = "https://github.com/example/manifests"
 directory = "example-dev"
-cluster = "example-dev"
-
-[[cluster]]
-name = "example-dev"
+connection-type = "eks"
 api-endpoint = "https://EXAMPLEDEVCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
 ca-path = "/etc/relcoord/example-dev-ca.pem"
 region = "eu-west-1"
 ```
 
-Authentication is the EKS bearer token: a presigned STS `GetCallerIdentity` URL
-signed as relcoord's own identity and re-signed as it ages. The cluster
-therefore needs an access entry for relcoord's IAM role, granting at least
-`get`, `list` and `watch` on the objects it deploys — and because the token is
-signed rather than fetched, that role can live in a different AWS account from
-the cluster.
+EKS authentication uses a presigned STS `GetCallerIdentity` URL signed as
+relcoord's own identity and re-signed as it ages. The cluster therefore needs
+an access entry for relcoord's IAM role, granting at least `get`, `list` and
+`watch` on the objects it deploys — and because the token is signed rather than
+fetched, that role can live in a different AWS account from the cluster.
 
 The API endpoint and CA certificate are configured rather than looked up:
 `eks:DescribeCluster` only resolves clusters in the caller's own account, so
@@ -253,7 +250,23 @@ aws eks describe-cluster --name example-dev --query 'cluster.{endpoint:endpoint,
 
 `ca-path` points at that CA decoded from base64 into a PEM file. `region`
 defaults to the region of relcoord's AWS session, and `eks-cluster-name` to the
-name of the cluster entry.
+name of the output.
+
+To watch the cluster relcoord itself runs in, configure a local connection:
+
+```toml
+[[output]]
+name = "local"
+repository = "https://github.com/example/manifests"
+directory = "local"
+connection-type = "local"
+```
+
+Local connections use `https://kubernetes.default.svc` and the service-account
+CA certificate and bearer token mounted under
+`/var/run/secrets/kubernetes.io/serviceaccount`. `api-endpoint` and `ca-path`
+can still be set explicitly when the in-cluster defaults are not suitable. The
+service account needs `get`, `list`, and `watch` access to deployed objects.
 
 The `relcoord-eks-kubeconfig` command writes the same credentials into a
 kubeconfig context, which is the quickest way to check that a cluster's access

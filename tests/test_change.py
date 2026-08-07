@@ -19,7 +19,7 @@ from relcoord.change import (
     DeploymentDetectionError,
     GitTransportError,
 )
-from relcoord.config import ClusterSettings, OutputSettings
+from relcoord.config import OutputSettings
 from relcoord.git import GitCredentialError
 
 
@@ -1073,12 +1073,7 @@ def test_change_processor_reports_the_objects_a_change_touched(
                 name="example-dev",
                 repository="https://github.com/acme/manifests.git",
                 directory=Path("example-dev"),
-                cluster="example-dev",
-            )
-        ],
-        clusters=[
-            ClusterSettings(
-                name="example-dev",
+                connection_type="eks",
                 api_endpoint="https://example.eks.amazonaws.com",
                 ca_path=Path("/ca.pem"),
             )
@@ -1106,19 +1101,19 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
     observed: dict[str, object] = {}
 
     class Detector:
-        def __init__(self, cluster: ClusterSettings) -> None:
-            self.cluster = cluster
+        def __init__(self, output: OutputSettings) -> None:
+            self.output = output
 
         def wait_for_success(self, **kwargs) -> None:
             observed.update(kwargs)
-            observed["cluster"] = self.cluster.name
+            observed["cluster"] = self.output.name
             detected.set()
 
         def close(self) -> None:
             observed["closed"] = True
 
-    def fake_for_cluster(cluster: ClusterSettings, **kwargs) -> Detector:
-        return Detector(cluster)
+    def fake_for_output(output: OutputSettings, **kwargs) -> Detector:
+        return Detector(output)
 
     def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
         (target / ".deploy").mkdir(parents=True)
@@ -1143,7 +1138,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
     monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
     monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
     monkeypatch.setattr(
-        change.KubernetesDeploymentDetector, "for_cluster", fake_for_cluster
+        change.KubernetesDeploymentDetector, "for_output", fake_for_output
     )
 
     ChangeProcessor(
@@ -1152,12 +1147,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
                 name="example-dev",
                 repository="https://github.com/acme/manifests.git",
                 directory=Path("example-dev"),
-                cluster="example-dev",
-            )
-        ],
-        clusters=[
-            ClusterSettings(
-                name="example-dev",
+                connection_type="eks",
                 api_endpoint="https://example.eks.amazonaws.com",
                 ca_path=Path("/ca.pem"),
             )
@@ -1197,7 +1187,7 @@ def test_change_processor_rejects_detection_without_a_cluster(
     monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
     monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
 
-    with pytest.raises(DeploymentDetectionError, match="does not name a cluster"):
+    with pytest.raises(DeploymentDetectionError, match="has no connection-type"):
         ChangeProcessor(
             "https://github.com/acme/manifests.git",
             detect_deployment=True,

@@ -9,7 +9,7 @@ import certifi
 import httpx
 import pytest
 
-from relcoord.config import ClusterSettings
+from relcoord.config import OutputSettings
 from relcoord.eks import TOKEN_PREFIX, EksTokenAuth
 from relcoord.kubernetes import (
     DEPLOY_ID_ANNOTATION,
@@ -291,8 +291,11 @@ def test_cluster_client_authenticates_with_a_token_for_the_eks_cluster(
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
 
     client = cluster_client(
-        ClusterSettings(
+        OutputSettings(
             name="example-dev",
+            repository="https://github.com/acme/manifests",
+            directory=Path("example-dev"),
+            connection_type="eks",
             api_endpoint="https://kubernetes.example.test/",
             ca_path=ca_path,
             region="eu-west-1",
@@ -307,11 +310,57 @@ def test_cluster_client_authenticates_with_a_token_for_the_eks_cluster(
     client.close()
 
 
+def test_cluster_client_authenticates_with_the_local_service_account_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token_path = tmp_path / "token"
+    token_path.write_text("service-account-token\n")
+    monkeypatch.setattr("relcoord.kubernetes.KUBERNETES_TOKEN_PATH", token_path)
+
+    client = cluster_client(
+        OutputSettings(
+            name="local",
+            repository="https://github.com/acme/manifests",
+            directory=Path("local"),
+            api_endpoint="https://kubernetes.default.svc/",
+            ca_path=Path(certifi.where()),
+            connection_type="local",
+        )
+    )
+
+    assert client.headers["authorization"] == "Bearer service-account-token"
+    assert client.auth is None
+    assert str(client.base_url) == "https://kubernetes.default.svc"
+    client.close()
+
+
+def test_cluster_client_rejects_a_missing_local_service_account_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token_path = tmp_path / "absent-token"
+    monkeypatch.setattr("relcoord.kubernetes.KUBERNETES_TOKEN_PATH", token_path)
+
+    with pytest.raises(DeploymentDetectionError, match="could not be read"):
+        cluster_client(
+            OutputSettings(
+                name="local",
+                repository="https://github.com/acme/manifests",
+                directory=Path("local"),
+                api_endpoint="https://kubernetes.default.svc",
+                ca_path=Path(certifi.where()),
+                connection_type="local",
+            )
+        )
+
+
 def test_cluster_client_rejects_a_missing_ca_certificate(tmp_path: Path) -> None:
     with pytest.raises(DeploymentDetectionError, match="does not exist"):
         cluster_client(
-            ClusterSettings(
+            OutputSettings(
                 name="example-dev",
+                repository="https://github.com/acme/manifests",
+                directory=Path("example-dev"),
+                connection_type="eks",
                 api_endpoint="https://kubernetes.example.test",
                 ca_path=tmp_path / "absent.pem",
             )
