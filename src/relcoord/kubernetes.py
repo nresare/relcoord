@@ -26,7 +26,8 @@ from typing import Any, Protocol
 import boto3
 import httpx
 
-from relcoord.config import ClusterSettings
+from relcoord.auth import KUBERNETES_TOKEN_PATH
+from relcoord.config import OutputSettings
 from relcoord.eks import EksTokenAuth
 
 logger = logging.getLogger(__name__)
@@ -116,31 +117,59 @@ class KubernetesResource:
         return f"{self.path_prefix}/namespaces/{namespace}/{self.name}"
 
 
-def cluster_client(cluster: ClusterSettings) -> httpx.Client:
-    """Return a client that talks to ``cluster`` as the ambient AWS identity."""
-    if not cluster.ca_path.exists():
+def cluster_client(output: OutputSettings) -> httpx.Client:
+    """Return a client for the cluster represented by ``output``."""
+    if output.connection_type is None:
+        raise DeploymentDetectionError(f"output {output.name} has no connection-type")
+    if output.api_endpoint is None:
+        raise DeploymentDetectionError(f"output {output.name} has no API endpoint")
+    if output.ca_path is None:
+        raise DeploymentDetectionError(f"output {output.name} has no CA certificate")
+    if not output.ca_path.exists():
         raise DeploymentDetectionError(
-            f"CA certificate {cluster.ca_path} for cluster {cluster.name} does "
-            "not exist"
+            f"CA certificate {output.ca_path} for cluster {output.name} does not exist"
         )
     try:
-        ssl_context = ssl.create_default_context(cafile=str(cluster.ca_path))
+        ssl_context = ssl.create_default_context(cafile=str(output.ca_path))
     except ssl.SSLError as exc:
         raise DeploymentDetectionError(
-            f"CA certificate {cluster.ca_path} for cluster {cluster.name} is not "
+            f"CA certificate {output.ca_path} for cluster {output.name} is not "
             f"a readable PEM certificate: {exc}"
         ) from exc
-    session = boto3.Session(region_name=cluster.region)
+    authentication: dict[str, Any]
+    if output.connection_type == "local":
+        authentication = {
+            "headers": {"Authorization": f"Bearer {_service_account_token(output)}"}
+        }
+    else:
+        session = boto3.Session(region_name=output.region)
+        authentication = {"auth": EksTokenAuth(session, output.eks_name)}
     return httpx.Client(
-        base_url=cluster.api_endpoint.rstrip("/"),
+        base_url=output.api_endpoint.rstrip("/"),
         verify=ssl_context,
-        auth=EksTokenAuth(session, cluster.eks_name),
         # Reads have to outlast a watch that is idle but healthy, which is the
         # normal state of a watch waiting for a deployment to roll out.
         timeout=httpx.Timeout(
             WATCH_TIMEOUT_SECONDS + 60.0, connect=CONNECT_TIMEOUT_SECONDS
         ),
+        **authentication,
     )
+
+
+def _service_account_token(output: OutputSettings) -> str:
+    try:
+        token = KUBERNETES_TOKEN_PATH.read_text().strip()
+    except OSError as exc:
+        raise DeploymentDetectionError(
+            f"service account token {KUBERNETES_TOKEN_PATH} for local cluster "
+            f"{output.name} could not be read: {exc}"
+        ) from exc
+    if not token:
+        raise DeploymentDetectionError(
+            f"service account token {KUBERNETES_TOKEN_PATH} for local cluster "
+            f"{output.name} is empty"
+        )
+    return token
 
 
 class KubernetesDeploymentDetector:
@@ -173,15 +202,15 @@ class KubernetesDeploymentDetector:
         self._resources_by_kind: dict[str, list[KubernetesResource]] | None = None
 
     @classmethod
-    def for_cluster(
+    def for_output(
         cls,
-        cluster: ClusterSettings,
+        output: OutputSettings,
         *,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> KubernetesDeploymentDetector:
         return cls(
-            client=cluster_client(cluster),
-            cluster_name=cluster.name,
+            client=cluster_client(output),
+            cluster_name=output.name,
             timeout_seconds=timeout_seconds,
             owns_client=True,
         )
