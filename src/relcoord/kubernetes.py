@@ -73,7 +73,9 @@ class Progress:
 
     ``detail`` reads as the tail of "waiting for Deployment/default/api to reach
     ...: ", so it describes what the object looks like now rather than what it
-    should look like.
+    should look like. A complete verdict carries one too where there is
+    something to say beyond the goal being met, so that a log of a run says
+    which state the check actually saw rather than only which it was after.
     """
 
     state: ProgressState
@@ -92,8 +94,8 @@ def _pending(detail: str) -> Progress:
     return Progress(ProgressState.PENDING, detail)
 
 
-def _complete() -> Progress:
-    return Progress(ProgressState.COMPLETE, "")
+def _complete(detail: str = "") -> Progress:
+    return Progress(ProgressState.COMPLETE, detail)
 
 
 def _failed(detail: str) -> Progress:
@@ -233,9 +235,10 @@ class KubernetesDeploymentDetector:
         goal: Goal,
         deadline: float,
     ) -> None:
+        began = time.monotonic()
         while True:
             progress = goal.progress(self._list_object(resource, ref))
-            if self._settled(ref, goal, progress):
+            if self._settled(ref, goal, progress, began):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -257,7 +260,7 @@ class KubernetesDeploymentDetector:
                 resource, ref, min(self._watch_timeout_seconds, remaining)
             ):
                 observed = None if event_type == "DELETED" else event_object
-                if self._settled(ref, goal, goal.progress(observed)):
+                if self._settled(ref, goal, goal.progress(observed), began):
                     return
             # The watch ended without the object reaching the state the change
             # asked for, which is what an expired watch looks like, and the loop
@@ -268,13 +271,21 @@ class KubernetesDeploymentDetector:
                 time.sleep(self._retry_delay_seconds)
 
     def _settled(
-        self, ref: KubernetesObjectRef, goal: Goal, progress: Progress
+        self,
+        ref: KubernetesObjectRef,
+        goal: Goal,
+        progress: Progress,
+        began: float,
     ) -> bool:
         """Return whether the wait is over, raising when it ended in failure.
 
         A failed verdict means the cluster has decided the object will not reach
         the goal, so waiting out the rest of the timeout would only delay the
         same answer with a worse explanation.
+
+        The line this logs is the only trace an object that was already in the
+        state the change asked for leaves behind, so it says what was observed
+        and how long it took to observe it rather than only which goal was met.
         """
         if progress.state is ProgressState.PENDING:
             return False
@@ -285,10 +296,12 @@ class KubernetesDeploymentDetector:
                 f"{goal.description}: {progress.detail}"
             )
         logger.info(
-            "observed %s in cluster %s reaching %s",
+            "observed %s in cluster %s reaching %s after %.1fs%s",
             _format_ref(ref),
             self._cluster_name or "<unnamed>",
             goal.description,
+            time.monotonic() - began,
+            f": {progress.detail}" if progress.detail else "",
         )
         return True
 
@@ -577,7 +590,10 @@ def _rollout_progress(obj: dict[str, Any]) -> Progress:
     elif available < updated:
         detail = f"{available} of {updated} updated replicas are available"
     else:
-        return _complete()
+        return _complete(
+            f"generation {generation} observed, {updated} of {desired} replicas "
+            "updated and available"
+        )
     return _pending(_with_replica_failure(status, detail))
 
 

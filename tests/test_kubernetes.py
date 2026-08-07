@@ -279,6 +279,24 @@ def test_detector_waits_for_the_controller_to_observe_a_change_it_need_not_roll(
     assert "has materialised in cluster example-dev" in caplog.text
 
 
+def test_detector_logs_what_it_observed_of_a_rollout_it_never_waited_for(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A Deployment already in the state the change asked for is waited for by
+    # doing nothing, so this line is the only evidence the rollout was checked.
+    handler = deployments_handler(
+        deployment("api", DEPLOY_ID, generation=7, replicas=3)
+    )
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        wait_for_deployment(handler)
+
+    assert (
+        "reaching deploy-id 0123456789abcdef with a complete rollout after 0.0s: "
+        "generation 7 observed, 3 of 3 replicas updated and available"
+    ) in caplog.text
+
+
 def test_detector_times_out_reporting_where_a_rollout_got_to() -> None:
     handler = deployments_handler(
         deployment("api", DEPLOY_ID, replicas=3, updated_replicas=1)
