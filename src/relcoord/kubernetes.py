@@ -6,10 +6,15 @@ manifest-builder reports which objects a change touched and stamps each of them
 with a deploy-id annotation. This module connects to the cluster those manifests
 are deployed to and waits, using watches rather than polling, until every
 changed object carries that deploy-id and every removed object is gone.
+
+Carrying the deploy-id only says that the write landed, not that it took effect.
+For Deployments the wait goes further and holds until the rollout the write asked
+for has finished; see ``_rollout_progress``.
 """
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import ssl
@@ -36,6 +41,9 @@ WATCH_TIMEOUT_SECONDS = 300.0
 # straight away, so a cluster refusing watches does not spin.
 WATCH_RETRY_SECONDS = 1.0
 CONNECT_TIMEOUT_SECONDS = 10.0
+# The apps/v1 deployments resource, the only kind with a rollout to wait for.
+DEPLOYMENTS_PATH_PREFIX = "/apis/apps/v1"
+DEPLOYMENTS_RESOURCE_NAME = "deployments"
 
 
 class KubernetesObjectRef(Protocol):
@@ -49,6 +57,47 @@ class KubernetesObjectRef(Protocol):
 
 class DeploymentDetectionError(Exception):
     pass
+
+
+class ProgressState(enum.Enum):
+    """How far an object is towards the state a change asked it to reach."""
+
+    PENDING = "pending"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class Progress:
+    """A verdict on one observed object, and why.
+
+    ``detail`` reads as the tail of "waiting for Deployment/default/api to reach
+    ...: ", so it describes what the object looks like now rather than what it
+    should look like.
+    """
+
+    state: ProgressState
+    detail: str
+
+
+@dataclass(frozen=True)
+class Goal:
+    """The state one object has to reach, and how to tell whether it has."""
+
+    description: str
+    progress: Callable[[dict[str, Any] | None], Progress]
+
+
+def _pending(detail: str) -> Progress:
+    return Progress(ProgressState.PENDING, detail)
+
+
+def _complete() -> Progress:
+    return Progress(ProgressState.COMPLETE, "")
+
+
+def _failed(detail: str) -> Progress:
+    return Progress(ProgressState.FAILED, detail)
 
 
 @dataclass(frozen=True)
@@ -149,26 +198,21 @@ class KubernetesDeploymentDetector:
         deadline = time.monotonic() + self._timeout_seconds
         waited_for = 0
         for ref in sorted(created_or_modified, key=_object_ref_sort_key):
+            resource = self._resource_for(ref)
             self._wait_for_object(
                 ref,
+                resource,
                 deploy_id=deploy_id,
-                satisfied=lambda obj: _deploy_id_of(obj) == deploy_id,
-                describe=lambda obj: (
-                    "it has not appeared"
-                    if obj is None
-                    else f"it has deploy-id {_deploy_id_of(obj) or '<missing>'!r}"
-                ),
-                goal=f"deploy-id {deploy_id}",
+                goal=_goal_for(resource, deploy_id),
                 deadline=deadline,
             )
             waited_for += 1
         for ref in sorted(removed, key=_object_ref_sort_key):
             self._wait_for_object(
                 ref,
+                self._resource_for(ref),
                 deploy_id=deploy_id,
-                satisfied=lambda obj: obj is None,
-                describe=lambda obj: "it still exists",
-                goal="removal",
+                goal=_REMOVAL_GOAL,
                 deadline=deadline,
             )
             waited_for += 1
@@ -183,41 +227,37 @@ class KubernetesDeploymentDetector:
     def _wait_for_object(
         self,
         ref: KubernetesObjectRef,
+        resource: KubernetesResource,
         *,
         deploy_id: str,
-        satisfied: Callable[[dict[str, Any] | None], bool],
-        describe: Callable[[dict[str, Any] | None], str],
-        goal: str,
+        goal: Goal,
         deadline: float,
     ) -> None:
-        resource = self._resource_for(ref)
         while True:
-            obj = self._list_object(resource, ref)
-            if satisfied(obj):
-                self._log_observed(ref, goal)
+            progress = goal.progress(self._list_object(resource, ref))
+            if self._settled(ref, goal, progress):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise DeploymentDetectionError(
                     f"timed out after {self._timeout_seconds:g}s waiting for "
-                    f"{_format_ref(ref)} to reach {goal} in cluster "
-                    f"{self._cluster_name or '<unnamed>'}: {describe(obj)}"
+                    f"{_format_ref(ref)} to reach {goal.description} in cluster "
+                    f"{self._cluster_name or '<unnamed>'}: {progress.detail}"
                 )
             logger.info(
                 "watching %s in cluster %s for %s (deploy-id %s): %s",
                 _format_ref(ref),
                 self._cluster_name or "<unnamed>",
-                goal,
+                goal.description,
                 deploy_id,
-                describe(obj),
+                progress.detail,
             )
             started = time.monotonic()
             for event_type, event_object in self._watch_object(
                 resource, ref, min(self._watch_timeout_seconds, remaining)
             ):
                 observed = None if event_type == "DELETED" else event_object
-                if satisfied(observed):
-                    self._log_observed(ref, goal)
+                if self._settled(ref, goal, goal.progress(observed)):
                     return
             # The watch ended without the object reaching the state the change
             # asked for, which is what an expired watch looks like, and the loop
@@ -227,13 +267,30 @@ class KubernetesDeploymentDetector:
             if time.monotonic() - started < self._retry_delay_seconds:
                 time.sleep(self._retry_delay_seconds)
 
-    def _log_observed(self, ref: KubernetesObjectRef, goal: str) -> None:
+    def _settled(
+        self, ref: KubernetesObjectRef, goal: Goal, progress: Progress
+    ) -> bool:
+        """Return whether the wait is over, raising when it ended in failure.
+
+        A failed verdict means the cluster has decided the object will not reach
+        the goal, so waiting out the rest of the timeout would only delay the
+        same answer with a worse explanation.
+        """
+        if progress.state is ProgressState.PENDING:
+            return False
+        if progress.state is ProgressState.FAILED:
+            raise DeploymentDetectionError(
+                f"{_format_ref(ref)} in cluster "
+                f"{self._cluster_name or '<unnamed>'} will not reach "
+                f"{goal.description}: {progress.detail}"
+            )
         logger.info(
             "observed %s in cluster %s reaching %s",
             _format_ref(ref),
             self._cluster_name or "<unnamed>",
-            goal,
+            goal.description,
         )
+        return True
 
     def _list_object(
         self, resource: KubernetesResource, ref: KubernetesObjectRef
@@ -417,6 +474,150 @@ def _watch_event(line: str) -> tuple[str, dict[str, Any] | None] | None:
         return None
     event_object = event.get("object")
     return event_type, event_object if isinstance(event_object, dict) else None
+
+
+_REMOVAL_GOAL = Goal(
+    description="removal",
+    progress=lambda obj: _complete() if obj is None else _pending("it still exists"),
+)
+
+
+def _goal_for(resource: KubernetesResource, deploy_id: str) -> Goal:
+    """Return what an object of this resource has to reach to count as deployed.
+
+    Every object has to carry the deploy-id, which is what says the write landed.
+    A Deployment has to have finished rolling that write out on top of it.
+    """
+    if (
+        resource.path_prefix == DEPLOYMENTS_PATH_PREFIX
+        and resource.name == DEPLOYMENTS_RESOURCE_NAME
+    ):
+        return Goal(
+            description=f"deploy-id {deploy_id} with a complete rollout",
+            progress=lambda obj: _deployment_progress(obj, deploy_id),
+        )
+    return Goal(
+        description=f"deploy-id {deploy_id}",
+        progress=lambda obj: _deploy_id_progress(obj, deploy_id),
+    )
+
+
+def _deploy_id_progress(obj: dict[str, Any] | None, deploy_id: str) -> Progress:
+    if obj is None:
+        return _pending("it has not appeared")
+    observed = _deploy_id_of(obj)
+    if observed != deploy_id:
+        return _pending(f"it has deploy-id {observed or '<missing>'!r}")
+    return _complete()
+
+
+def _deployment_progress(obj: dict[str, Any] | None, deploy_id: str) -> Progress:
+    """Return how far a Deployment is towards having rolled the change out."""
+    landed = _deploy_id_progress(obj, deploy_id)
+    if landed.state is not ProgressState.COMPLETE or obj is None:
+        return landed
+    return _rollout_progress(obj)
+
+
+def _rollout_progress(obj: dict[str, Any]) -> Progress:
+    """Return how far an observed Deployment is through its rollout.
+
+    These are the checks ``kubectl rollout status`` makes, in its order, and they
+    cover all three shapes a change to a Deployment can take without having to
+    tell them apart up front. A change that alters the pod template goes through
+    every check: the controller observes the new generation, the new ReplicaSet
+    scales up to the full count, the old ones drain, and the new pods become
+    available. A change that leaves the pod template alone satisfies the replica
+    checks already, so it comes down to the generation having been observed. A
+    Deployment being created for the first time has no old ReplicaSet to drain,
+    so it comes down to its pods becoming available.
+
+    The replica counts are enough on their own to say that every Ready pod
+    belongs to the new ReplicaSet: ``status.replicas`` counts the pods of every
+    ReplicaSet the Deployment owns and ``status.updatedReplicas`` only those
+    matching the current pod template, so the two agreeing means the old
+    ReplicaSets have no pods left. That keeps this a pure function of the
+    Deployment, with no ReplicaSets to list and none to read.
+    """
+    spec = _child(obj, "spec")
+    status = _child(obj, "status")
+    if spec.get("paused") is True:
+        return _failed("it is paused, so its rollout cannot make progress")
+
+    generation = _count(_child(obj, "metadata").get("generation"))
+    observed_generation = _count(status.get("observedGeneration"))
+    if observed_generation < generation:
+        return _pending(
+            f"the deployment controller has observed generation "
+            f"{observed_generation}, not {generation}"
+        )
+
+    progressing = _condition(status, "Progressing")
+    if (
+        progressing.get("status") == "False"
+        and progressing.get("reason") == "ProgressDeadlineExceeded"
+    ):
+        return _failed(
+            "its rollout exceeded the progress deadline: "
+            f"{progressing.get('message') or 'no message given'}"
+        )
+
+    # Absent from the JSON means zero: the replica counts are all omitempty.
+    desired = _count(spec.get("replicas"), default=1)
+    updated = _count(status.get("updatedReplicas"))
+    replicas = _count(status.get("replicas"))
+    available = _count(status.get("availableReplicas"))
+    if updated < desired:
+        detail = f"{updated} of {desired} replicas have been updated"
+    elif replicas > updated:
+        detail = (
+            f"{replicas - updated} replica(s) of the previous ReplicaSet have "
+            "not terminated"
+        )
+    elif available < updated:
+        detail = f"{available} of {updated} updated replicas are available"
+    else:
+        return _complete()
+    return _pending(_with_replica_failure(status, detail))
+
+
+def _with_replica_failure(status: dict[str, Any], detail: str) -> str:
+    """Add why the ReplicaSet cannot create pods, when it is saying so.
+
+    A ReplicaFailure explains a rollout that is going nowhere long before the
+    progress deadline does, but it also clears on its own once whatever is
+    rejecting the pods stops, so it says why the wait is where it is rather than
+    that the wait is over.
+    """
+    replica_failure = _condition(status, "ReplicaFailure")
+    if replica_failure.get("status") != "True":
+        return detail
+    message = replica_failure.get("message") or replica_failure.get("reason")
+    return (
+        f"{detail}; its ReplicaSet cannot create pods: {message or 'no message given'}"
+    )
+
+
+def _condition(status: dict[str, Any], condition_type: str) -> dict[str, Any]:
+    conditions = status.get("conditions")
+    if not isinstance(conditions, list):
+        return {}
+    for condition in conditions:
+        if isinstance(condition, dict) and condition.get("type") == condition_type:
+            return condition
+    return {}
+
+
+def _child(obj: dict[str, Any], key: str) -> dict[str, Any]:
+    value = obj.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _count(value: Any, default: int = 0) -> int:
+    # bool is an int, and a JSON true here would be a nonsense replica count.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return default
 
 
 def _deploy_id_of(obj: dict[str, Any] | None) -> str | None:
