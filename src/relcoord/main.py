@@ -28,6 +28,8 @@ from relcoord.surreal_store import SurrealImageInfoStore
 
 DEFAULT_CONFIG_PATH = "/config/relcoord.toml"
 LOG_FORMAT = "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s: %(message)s"
+# The HTTP client libraries, which log a line for every request relcoord makes.
+HTTP_CLIENT_LOGGERS = ("httpx", "httpcore")
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +140,24 @@ def configure_logging(log_level: str) -> None:
             format=LOG_FORMAT,
             datefmt="%Y-%m-%d %H:%M:%S %z",
         )
+    _quieten_http_client_logging(level)
+
+
+def _quieten_http_client_logging(level: int) -> None:
+    """Keep the HTTP clients from logging a line per request.
+
+    relcoord talks to several APIs to serve one change, and httpx logs every
+    request it makes at INFO, which buries the lines about the change itself.
+    Asking for DEBUG is asking to see the traffic, so leave them alone then.
+    """
+    if level <= logging.DEBUG:
+        return
+    # Never below the configured level: a logger with a level of its own is
+    # judged by that level rather than the root's, so pinning these to WARNING
+    # under a quieter root would make them the loudest thing in the log.
+    quiet_level = max(level, logging.WARNING)
+    for name in HTTP_CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(quiet_level)
 
 
 if __name__ == "__main__":

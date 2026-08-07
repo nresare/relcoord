@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import asyncio
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,12 @@ from relcoord.change import ChangeProcessor
 from relcoord.config import OutputSettings, PersistenceSettings, Settings
 from relcoord.dynamodb_store import DynamoDBImageInfoStore
 from relcoord.in_memory_store import InMemoryImageInfoStore
-from relcoord.main import configure_logging, make_change_processor, make_store
+from relcoord.main import (
+    HTTP_CLIENT_LOGGERS,
+    configure_logging,
+    make_change_processor,
+    make_store,
+)
 from relcoord.retrying_store import RetryingImageInfoStore
 
 
@@ -97,3 +104,45 @@ def test_configure_logging_uses_configured_log_level() -> None:
         assert root_logger.level == logging.WARNING
     finally:
         root_logger.setLevel(original_level)
+
+
+@contextmanager
+def restored_log_levels() -> Iterator[None]:
+    loggers = [
+        logging.getLogger(),
+        *(logging.getLogger(n) for n in HTTP_CLIENT_LOGGERS),
+    ]
+    original_levels = [logger.level for logger in loggers]
+    try:
+        yield
+    finally:
+        for logger, level in zip(loggers, original_levels, strict=True):
+            logger.setLevel(level)
+
+
+def test_configure_logging_quietens_the_http_clients() -> None:
+    with restored_log_levels():
+        configure_logging("INFO")
+
+        # A line per request to every API relcoord talks to, otherwise.
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
+
+
+def test_configure_logging_leaves_the_http_clients_alone_at_debug() -> None:
+    with restored_log_levels():
+        logging.getLogger("httpx").setLevel(logging.NOTSET)
+
+        configure_logging("DEBUG")
+
+        # Asking for debug is asking to see the traffic.
+        assert logging.getLogger("httpx").level == logging.NOTSET
+
+
+def test_configure_logging_does_not_make_the_http_clients_louder() -> None:
+    with restored_log_levels():
+        configure_logging("ERROR")
+
+        # WARNING here would out-shout a root logger set to ERROR, since a
+        # logger with a level of its own is judged by that rather than the root.
+        assert logging.getLogger("httpx").level == logging.ERROR
