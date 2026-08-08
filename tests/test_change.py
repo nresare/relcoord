@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from io import BytesIO
@@ -214,15 +215,16 @@ def test_change_processor_reports_progress_for_each_step(
         progress=events.append,
     )
 
+    # The temporary workspace and the manifests commit are logged rather than
+    # streamed: one is a path nobody watching a deployment cares about, and the
+    # other is named by the push lines either side of it.
     assert [event.phase for event in events] == [
-        "workspace",
         "source-checkout",
         "deploy-config",
         "manifests-checkout",
         "generate",
         "generated",
         "changed-objects",
-        "commit",
         "push",
         "pushed",
     ]
@@ -238,24 +240,26 @@ def test_change_processor_reports_progress_for_each_step(
         "removed": [],
     }
     assert by_phase["changed-objects"].message == (
-        "output manifests created or modified Deployment/config/api "
-        "(deploy-id 0123456789abcdef)"
+        "manifests: updated Deployment config/api"
     )
     assert by_phase["source-checkout"].detail == {
         "repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
     }
-    assert by_phase["source-checkout"].message == (
-        "checking out source repo https://github.com/acme/config.git at commit deadbeef"
-    )
+    assert by_phase["source-checkout"].message == "checking out acme/config at deadbee"
     assert by_phase["deploy-config"].detail["namespace"] == "config"
     assert by_phase["deploy-config"].detail["system"] is False
+    assert by_phase["deploy-config"].message == (
+        "generating for namespace config from .deploy"
+    )
     assert by_phase["generated"].detail["generated"] == 1
     assert "paths" not in by_phase["generated"].detail
+    assert by_phase["generated"].message == "manifests: 1 of 1 manifests changed"
     assert by_phase["push"].detail == {
         "repository": "https://github.com/acme/manifests.git",
         "manifest_commit": "feedface",
     }
+    assert by_phase["push"].message == "pushing feedfac to acme/manifests"
 
 
 def test_change_processor_reports_no_changes_progress(
@@ -301,7 +305,7 @@ def test_change_processor_reports_no_changes_progress(
     )
 
     assert [event.phase for event in events][-1] == "no-changes"
-    assert "nothing to commit or push" in events[-1].message
+    assert events[-1].message == "no changes for acme/manifests"
 
 
 def test_change_processor_generates_configured_outputs_with_vars(
@@ -1484,8 +1488,13 @@ def test_rollout_skips_a_stage_whose_outputs_the_change_does_not_affect(
         tmp_path, monkeypatch, changed={"observability"}
     )
 
-    processor.process("https://github.com/acme/config.git", "deadbeef", None)
+    events: list[ChangeProgress] = []
+    processor.process(
+        "https://github.com/acme/config.git", "deadbeef", None, progress=events.append
+    )
 
+    verified = [event for event in events if event.phase == "rollout-stage-verified"]
+    assert verified[0].message == "stage 1 of 2 skipped: platform-dev unaffected"
     assert calls == [
         "clone",
         "generate:platform-dev",
@@ -1534,7 +1543,6 @@ def test_rollout_reports_progress_for_each_stage(
     )
 
     assert [event.phase for event in events] == [
-        "workspace",
         "source-checkout",
         "deploy-config",
         "rollout-stage",
@@ -1542,7 +1550,6 @@ def test_rollout_reports_progress_for_each_stage(
         "generate",
         "generated",
         "changed-objects",
-        "commit",
         "push",
         "pushed",
         "deployment-detection",
@@ -1553,7 +1560,6 @@ def test_rollout_reports_progress_for_each_stage(
         "generate",
         "generated",
         "changed-objects",
-        "commit",
         "push",
         "pushed",
         "deployment-detection",
@@ -1574,11 +1580,26 @@ def test_rollout_reports_progress_for_each_stage(
             "outputs": ["platform-prod", "observability"],
         },
     ]
-    verified = [event for event in events if event.phase == "rollout-stage-verified"]
-    assert [event.message for event in verified] == [
-        "rollout linear stage 1/2: deployment observed in platform-dev",
-        "rollout linear stage 2/2: deployment observed in observability",
+    assert [event.message for event in stages] == [
+        "rollout linear, stage 1 of 2: platform-dev",
+        "rollout linear, stage 2 of 2: platform-prod and observability",
     ]
+    by_phase = {event.phase: event for event in events}
+    assert by_phase["deployment-detection"].message == (
+        "waiting for observability to pick up the change"
+    )
+    # How long the deployment took is what a reader is waiting to hear, so the
+    # message carries it; the value itself is whatever the clock said.
+    verified = [event for event in events if event.phase == "rollout-stage-verified"]
+    assert re.fullmatch(
+        r"stage 1 of 2 verified: platform-dev picked it up after \d+\.\d+s",
+        verified[0].message,
+    )
+    assert re.fullmatch(
+        r"stage 2 of 2 verified: observability picked it up after \d+\.\d+s",
+        verified[1].message,
+    )
+    assert verified[1].detail["outputs"] == ["observability"]
 
 
 def test_change_stages_without_rollouts_deploy_every_output_at_once() -> None:
@@ -1604,3 +1625,160 @@ def test_change_stages_reject_an_unconfigured_output() -> None:
         "platform-staging",
     ):
         change._change_stages(ROLLOUT_OUTPUTS, (rollout,))
+
+
+@pytest.mark.parametrize(
+    ("repo", "expected"),
+    [
+        pytest.param(
+            "https://github.com/portswigger-cloud/system",
+            "portswigger-cloud/system",
+            id="https",
+        ),
+        pytest.param(
+            "https://github.com/acme/manifests.git", "acme/manifests", id="dot-git"
+        ),
+        pytest.param(
+            "https://github.com/acme/manifests/", "acme/manifests", id="slash"
+        ),
+        pytest.param("acme/config", "acme/config", id="already-short"),
+        pytest.param("manifests", "manifests", id="one-part"),
+    ],
+)
+def test_short_repo_names_a_repository_as_owner_and_name(
+    repo: str, expected: str
+) -> None:
+    assert change.short_repo(repo) == expected
+
+
+def test_short_commit_matches_what_git_prints() -> None:
+    assert change.short_commit("b8d4f34d8fd265311b7a379072441675ff524f6e") == "b8d4f34"
+    assert change.short_commit("deadbee") == "deadbee"
+    assert change.short_commit("dead") == "dead"
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        pytest.param([], "", id="none"),
+        pytest.param(["platform-dev"], "platform-dev", id="one"),
+        pytest.param(
+            ["platform-prod", "observability"],
+            "platform-prod and observability",
+            id="two",
+        ),
+        pytest.param(["a", "b", "c"], "a, b and c", id="three"),
+    ],
+)
+def test_join_names_reads_as_a_sentence(names: list[str], expected: str) -> None:
+    assert change.join_names(names) == expected
+
+
+def test_describe_refs_names_objects_the_way_kubectl_talks_about_them() -> None:
+    refs = (
+        Ref(kind="Deployment", namespace="relcoord", name="relcoord"),
+        Ref(kind="Namespace", namespace=None, name="relcoord"),
+    )
+
+    assert change._describe_refs(refs) == (
+        "Deployment relcoord/relcoord, Namespace relcoord"
+    )
+
+
+def test_describe_refs_cuts_a_long_list_short() -> None:
+    """A shared label change rewrites everything, and the detail keeps the rest."""
+    refs = tuple(
+        Ref(kind="ConfigMap", namespace="relcoord", name=f"c{index}")
+        for index in range(14)
+    )
+
+    assert change._describe_refs(refs) == (
+        "ConfigMap relcoord/c0, ConfigMap relcoord/c1, ConfigMap relcoord/c2 "
+        "and 11 more"
+    )
+
+
+CHANGED = (Ref(kind="Deployment", namespace="relcoord", name="relcoord"),)
+GONE = (Ref(kind="ConfigMap", namespace="relcoord", name="old"),)
+
+
+@pytest.mark.parametrize(
+    ("changed", "removed", "expected"),
+    [
+        pytest.param((), (), "platform-dev: none of 95 manifests changed", id="none"),
+        pytest.param(
+            CHANGED, (), "platform-dev: 1 of 95 manifests changed", id="changed"
+        ),
+        pytest.param(
+            CHANGED,
+            GONE,
+            "platform-dev: 1 of 95 manifests changed, 1 removed",
+            id="changed-and-removed",
+        ),
+        pytest.param(
+            (),
+            GONE,
+            "platform-dev: 0 of 95 manifests changed, 1 removed",
+            id="removed-only",
+        ),
+    ],
+)
+def test_generated_message_leads_with_what_the_change_did(
+    changed: tuple[Ref, ...], removed: tuple[Ref, ...], expected: str
+) -> None:
+    output = OutputSettings(
+        name="platform-dev",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-dev"),
+    )
+
+    assert change._generated_message(output, 95, changed, removed) == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "declares_targets", "expected"),
+    [
+        pytest.param(
+            None, True, "generating manifests for target platform-dev", id="target"
+        ),
+        pytest.param(
+            "prod",
+            True,
+            "generating manifests for target prod into platform-dev",
+            id="renamed-target",
+        ),
+        pytest.param(
+            None, False, "generating manifests for output platform-dev", id="vars"
+        ),
+    ],
+)
+def test_generating_message_uses_the_config_repositorys_own_terms(
+    target: str | None, declares_targets: bool, expected: str
+) -> None:
+    output = OutputSettings(
+        name="platform-dev",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-dev"),
+        target=target,
+    )
+
+    assert change._generating_message(output, declares_targets) == expected
+
+
+def test_stage_verified_message_reports_a_skipped_stage() -> None:
+    stage = change._change_stages(ROLLOUT_OUTPUTS, [LINEAR_ROLLOUT])[1]
+
+    assert change._stage_verified_message(stage, []) == (
+        "stage 2 of 2 skipped: platform-prod and observability unaffected"
+    )
+
+
+def test_stage_verified_message_reports_every_cluster_that_picked_it_up() -> None:
+    stage = change._change_stages(ROLLOUT_OUTPUTS, [LINEAR_ROLLOUT])[1]
+
+    assert change._stage_verified_message(
+        stage, [("platform-prod", 27.94), ("observability", 3.1)]
+    ) == (
+        "stage 2 of 2 verified: picked up by platform-prod after 27.9s "
+        "and observability after 3.1s"
+    )

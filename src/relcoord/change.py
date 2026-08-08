@@ -6,6 +6,7 @@ import logging
 import shutil
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -43,6 +44,14 @@ FULL_DIFF_REFERENCE = "returned in the relcoord response for this request"
 # Subdirectory of the configured plugins repository holding the plugin modules,
 # matching the layout manifest-builder expects of a config directory.
 PLUGINS_DIRECTORY = "plugins"
+
+# How much of a commit hash a progress message shows, matching what git prints.
+SHORT_COMMIT_LENGTH = 7
+
+# How many Kubernetes objects a progress message names before summarising the
+# rest as a count. A change to a shared label rewrites everything that carries
+# it, and a line listing hundreds of objects is one nobody reads.
+MAX_REPORTED_OBJECTS = 3
 
 
 class ChangeProcessingError(Exception):
@@ -186,9 +195,10 @@ class ChangeStage:
 
     @property
     def label(self) -> str:
+        """How a stage is referred to once its rollout has been named."""
         if self.rollout is None:
             return "all outputs"
-        return f"rollout {self.rollout} stage {self.index}/{self.count}"
+        return f"stage {self.index} of {self.count}"
 
 
 @dataclass(frozen=True)
@@ -224,28 +234,42 @@ class ChangeProcessor:
             checkout_by_repository = _checkout_paths_by_repository(
                 workdir, output_settings
             )
-            message = (
-                f"created temporary workspace {workdir} for repo {repo} "
-                f"at commit {commit}"
+            # The workspace is a temporary directory nobody watching a deployment
+            # cares about, so it is logged for whoever debugs a change and left
+            # out of the stream.
+            logger.info(
+                "change step 1/7: created temporary workspace %s for repo %s "
+                "at commit %s",
+                workdir,
+                repo,
+                commit,
             )
-            logger.info("change step 1/7: %s", message)
-            report("workspace", message, workdir=str(workdir))
-            message = f"checking out source repo {repo} at commit {commit}"
-            logger.info("change step 2/7: %s", message)
-            report("source-checkout", message, repo=repo, commit=commit)
+            logger.info(
+                "change step 2/7: checking out source repo %s at commit %s",
+                repo,
+                commit,
+            )
+            report(
+                "source-checkout",
+                f"checking out {short_repo(repo)} at {short_commit(commit)}",
+                repo=repo,
+                commit=commit,
+            )
             _checkout_commit(repo, commit, source_checkout, self.idcat)
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
             declares_targets = _declares_targets(deploy_config)
-            message = (
-                f"found deploy config at {deploy_config} (system mode: {system}, "
-                f"targets: {declares_targets})"
+            logger.info(
+                "change step 3/7: found deploy config at %s (system mode: %s, "
+                "targets: %s)",
+                deploy_config,
+                system,
+                declares_targets,
             )
-            logger.info("change step 3/7: %s", message)
             report(
                 "deploy-config",
-                message,
+                _deploy_config_message(namespace, config_path, system),
                 deploy_config=str(deploy_config),
                 system=system,
                 namespace=namespace,
@@ -296,12 +320,16 @@ class ChangeProcessor:
                         result.created_or_modified or result.removed
                         for result in generation_results
                     ):
-                        message = (
-                            f"manifest-builder produced no changes for repo "
-                            f"{repository}; nothing to commit or push"
+                        logger.info(
+                            "change step 6/7: manifest-builder produced no changes "
+                            "for repo %s; nothing to commit or push",
+                            repository,
                         )
-                        logger.info("change step 6/7: %s", message)
-                        report("no-changes", message, repository=repository)
+                        report(
+                            "no-changes",
+                            f"no changes for {short_repo(repository)}",
+                            repository=repository,
+                        )
                         continue
 
                     self._push_manifests(
@@ -340,9 +368,16 @@ class ChangeProcessor:
         The stages of a rollout generate into the same checkout, each committing
         on top of what the stage before it committed, and push what they added.
         """
-        message = f"checking out manifests repo {repository} into {manifests_checkout}"
-        logger.info("change step 4/7: %s", message)
-        report("manifests-checkout", message, repository=repository)
+        logger.info(
+            "change step 4/7: checking out manifests repo %s into %s",
+            repository,
+            manifests_checkout,
+        )
+        report(
+            "manifests-checkout",
+            f"checking out {short_repo(repository)}",
+            repository=repository,
+        )
         _clone_repository(
             repository,
             manifests_checkout,
@@ -387,7 +422,7 @@ class ChangeProcessor:
         )
         report(
             "generate",
-            f"invoking manifest-builder for output {output.name}",
+            _generating_message(output, declares_targets),
             output=output.name,
             repository=output.repository,
             directory=str(output.directory),
@@ -404,18 +439,6 @@ class ChangeProcessor:
             **selection,
         )
         generated = _written_paths(generation_result)
-        message = (
-            f"manifest-builder generated {len(generated)} file(s) "
-            f"for output {output.name}"
-        )
-        logger.info("change step 5/7: %s", message)
-        report(
-            "generated",
-            message,
-            output=output.name,
-            repository=output.repository,
-            generated=len(generated),
-        )
         deploy_id = _deploy_id(generation_result)
         if self.detect_deployment and deploy_id is None:
             raise DeploymentDetectionError(
@@ -424,14 +447,35 @@ class ChangeProcessor:
             )
         created_or_modified = _sorted_refs(generation_result.created_or_modified)
         removed_refs = _sorted_refs(generation_result.removed)
+        logger.info(
+            "change step 5/7: manifest-builder generated %d file(s) for output %s",
+            len(generated),
+            output.name,
+        )
+        report(
+            "generated",
+            _generated_message(
+                output, len(generated), created_or_modified, removed_refs
+            ),
+            output=output.name,
+            repository=output.repository,
+            generated=len(generated),
+            changed=len(created_or_modified),
+            removed=len(removed_refs),
+        )
         if created_or_modified or removed_refs:
-            message = _changed_objects_message(
-                output, created_or_modified, removed_refs, deploy_id
+            logger.info(
+                "change step 5/7: output %s in cluster %s changed %s (deploy-id %s)",
+                output.name,
+                _cluster_name(output) or "<none>",
+                ", ".join(
+                    _format_ref(ref) for ref in (*created_or_modified, *removed_refs)
+                ),
+                deploy_id or "<none>",
             )
-            logger.info("change step 5/7: %s", message)
             report(
                 "changed-objects",
-                message,
+                _changed_objects_message(output, created_or_modified, removed_refs),
                 output=output.name,
                 repository=output.repository,
                 cluster=_cluster_name(output),
@@ -466,19 +510,22 @@ class ChangeProcessor:
     ) -> None:
         """Push what manifest-builder committed for one stage of one repository."""
         manifest_commit = _head_commit(manifests_checkout)
-        message = f"manifest-builder created manifests commit {manifest_commit}"
-        logger.info("change step 6/7: %s", message)
-        report(
-            "commit",
-            message,
-            repository=repository,
-            manifest_commit=manifest_commit,
+        # The commit is named by the push lines either side of it, so it is logged
+        # rather than reported: one action is worth one line in the stream.
+        logger.info(
+            "change step 6/7: manifest-builder created manifests commit %s",
+            manifest_commit,
         )
-        message = f"pushing manifests commit {manifest_commit} to {repository}"
-        logger.info("change step 7/7: %s", message)
+        short = short_commit(manifest_commit)
+        target = short_repo(repository)
+        logger.info(
+            "change step 7/7: pushing manifests commit %s to %s",
+            manifest_commit,
+            repository,
+        )
         report(
             "push",
-            message,
+            f"pushing {short} to {target}",
             repository=repository,
             manifest_commit=manifest_commit,
         )
@@ -487,14 +534,16 @@ class ChangeProcessor:
             repository,
             self.idcat,
         )
-        message = (
-            f"pushed manifests commit {manifest_commit} for source repo "
-            f"{repo} at commit {commit}"
+        logger.info(
+            "change complete: pushed manifests commit %s for source repo %s "
+            "at commit %s",
+            manifest_commit,
+            repo,
+            commit,
         )
-        logger.info("change complete: %s", message)
         report(
             "pushed",
-            message,
+            f"pushed {short} to {target}",
             repository=repository,
             manifest_commit=manifest_commit,
         )
@@ -521,13 +570,13 @@ class ChangeProcessor:
             for output, result in results
             if result.created_or_modified or result.removed
         ]
+        observed: list[tuple[str, float]] = []
         for output, generation_result in deployed:
             deploy_id = _deploy_id(generation_result)
             connection = self._connection_for(output)
             report(
                 "deployment-detection",
-                "waiting for deployment of manifest-builder deploy-id "
-                f"{deploy_id} in cluster {output.name}",
+                f"waiting for {output.name} to pick up the change",
                 deploy_id=deploy_id,
                 output=output.name,
                 cluster=output.name,
@@ -539,21 +588,18 @@ class ChangeProcessor:
                     connection,
                     self.deployment_detector,
                 )
-            else:
-                _await_deployment_detection(
-                    generation_result,
-                    deploy_id,
-                    connection,
-                    self.deployment_detector,
-                )
+                continue
+            started = time.monotonic()
+            _await_deployment_detection(
+                generation_result,
+                deploy_id,
+                connection,
+                self.deployment_detector,
+            )
+            observed.append((output.name, time.monotonic() - started))
         if stage.rollout is None:
             return
-        names = ", ".join(output.name for output, _ in deployed)
-        message = (
-            f"{stage.label}: deployment observed in {names}"
-            if deployed
-            else f"{stage.label}: nothing deployed, moving on"
-        )
+        message = _stage_verified_message(stage, observed)
         logger.info("change step 7/7: %s", message)
         report(
             "rollout-stage-verified",
@@ -561,7 +607,7 @@ class ChangeProcessor:
             rollout=stage.rollout,
             stage=stage.index,
             stages=stage.count,
-            outputs=[output.name for output, _ in deployed],
+            outputs=[name for name, _ in observed],
         )
 
     def _connection_for(self, output: OutputSettings) -> OutputSettings | None:
@@ -660,28 +706,37 @@ class DiffCommentProcessor:
             checkout_by_repository = _checkout_paths_by_repository(
                 workdir, output_settings
             )
-            message = (
-                f"created temporary workspace {workdir} for repo {repo} "
-                f"at commit {commit}"
+            logger.info(
+                "diff step 1/6: created temporary workspace %s for repo %s "
+                "at commit %s",
+                workdir,
+                repo,
+                commit,
             )
-            logger.info("diff step 1/6: %s", message)
-            report("workspace", message, workdir=str(workdir))
-            message = f"checking out source repo {repo} at commit {commit}"
-            logger.info("diff step 2/6: %s", message)
-            report("source-checkout", message, repo=repo, commit=commit)
+            logger.info(
+                "diff step 2/6: checking out source repo %s at commit %s", repo, commit
+            )
+            report(
+                "source-checkout",
+                f"checking out {short_repo(repo)} at {short_commit(commit)}",
+                repo=repo,
+                commit=commit,
+            )
             _checkout_commit(repo, commit, source_checkout, self.idcat)
             deploy_config, namespace = _deploy_config_and_namespace(
                 source_checkout, repo, commit, config_path, system
             )
             declares_targets = _declares_targets(deploy_config)
-            message = (
-                f"found deploy config at {deploy_config} (system mode: {system}, "
-                f"targets: {declares_targets})"
+            logger.info(
+                "diff step 3/6: found deploy config at %s (system mode: %s, "
+                "targets: %s)",
+                deploy_config,
+                system,
+                declares_targets,
             )
-            logger.info("diff step 3/6: %s", message)
             report(
                 "deploy-config",
-                message,
+                _deploy_config_message(namespace, config_path, system),
                 deploy_config=str(deploy_config),
                 system=system,
                 namespace=namespace,
@@ -701,9 +756,16 @@ class DiffCommentProcessor:
             total_generated = 0
 
             for repository, manifests_checkout in checkout_by_repository.items():
-                message = f"checking out manifests repo {repository} into {manifests_checkout}"
-                logger.info("diff step 4/6: %s", message)
-                report("manifests-checkout", message, repository=repository)
+                logger.info(
+                    "diff step 4/6: checking out manifests repo %s into %s",
+                    repository,
+                    manifests_checkout,
+                )
+                report(
+                    "manifests-checkout",
+                    f"checking out {short_repo(repository)}",
+                    repository=repository,
+                )
                 _clone_repository(
                     repository,
                     manifests_checkout,
@@ -730,7 +792,7 @@ class DiffCommentProcessor:
                     )
                     report(
                         "generate",
-                        f"invoking manifest-builder for output {output.name}",
+                        _generating_message(output, declares_targets),
                         output=output.name,
                         repository=repository,
                         directory=str(output.directory),
@@ -747,14 +809,20 @@ class DiffCommentProcessor:
                         **selection,
                     )
                     generated = _written_paths(generation_result)
-                    message = (
-                        f"manifest-builder generated {len(generated)} file(s) "
-                        f"for output {output.name}"
+                    logger.info(
+                        "diff step 5/6: manifest-builder generated %d file(s) "
+                        "for output %s",
+                        len(generated),
+                        output.name,
                     )
-                    logger.info("diff step 5/6: %s", message)
                     report(
                         "generated",
-                        message,
+                        _generated_message(
+                            output,
+                            len(generated),
+                            _sorted_refs(generation_result.created_or_modified),
+                            _sorted_refs(generation_result.removed),
+                        ),
                         output=output.name,
                         repository=repository,
                         generated=len(generated),
@@ -775,23 +843,28 @@ class DiffCommentProcessor:
                 )
                 if repository_diff.diff.strip():
                     changed_files = _changed_file_count(repository_diff)
-                    message = (
-                        f"manifest-builder changed {changed_files} file(s) "
-                        f"in repo {repository}"
+                    files = "file" if changed_files == 1 else "files"
+                    logger.info(
+                        "diff step 6/6: manifest-builder changed %d file(s) in repo %s",
+                        changed_files,
+                        repository,
                     )
-                    logger.info("diff step 6/6: %s", message)
                     report(
                         "diff",
-                        message,
+                        f"{short_repo(repository)}: {changed_files} {files} changed",
                         repository=repository,
                         changed=changed_files,
                     )
                 else:
-                    message = (
-                        f"manifest-builder produced no changes for repo {repository}"
+                    logger.info(
+                        "diff step 6/6: manifest-builder produced no changes for repo %s",
+                        repository,
                     )
-                    logger.info("diff step 6/6: %s", message)
-                    report("no-changes", message, repository=repository)
+                    report(
+                        "no-changes",
+                        f"no changes for {short_repo(repository)}",
+                        repository=repository,
+                    )
 
             comment_body = build_comment_body(
                 _diff_sections(repository_diffs),
@@ -822,12 +895,16 @@ class DiffCommentProcessor:
         report: Callable[..., None],
     ) -> DiffComment:
         if pull_request is None:
-            message = (
-                "no pull request requested; not posting a manifest diff comment "
-                f"for repo {repo}"
+            logger.info(
+                "diff complete: no pull request requested; not posting a manifest "
+                "diff comment for repo %s",
+                repo,
             )
-            logger.info("diff complete: %s", message)
-            report("no-comment", message, repo=repo)
+            report(
+                "no-comment",
+                "no pull request to comment on; returning the diff instead",
+                repo=repo,
+            )
             return DiffComment(body=body, posted=False)
 
         commenter = (
@@ -835,11 +912,17 @@ class DiffCommentProcessor:
             if self.commenter is not None
             else GithubIssueCommenter(idcat=self.idcat)
         )
-        message = (
-            f"posting manifest diff comment to {repo} pull request #{pull_request}"
+        logger.info(
+            "diff step 6/6: posting manifest diff comment to %s pull request #%s",
+            repo,
+            pull_request,
         )
-        logger.info("diff step 6/6: %s", message)
-        report("comment", message, repo=repo, pull_request=pull_request)
+        report(
+            "comment",
+            f"commenting on {short_repo(repo)} pull request #{pull_request}",
+            repo=repo,
+            pull_request=pull_request,
+        )
         try:
             url = commenter.post_comment(repo, pull_request, body)
         except GitCredentialError as exc:
@@ -850,11 +933,14 @@ class DiffCommentProcessor:
         except GithubCommentError as exc:
             raise CommentPostError(str(exc)) from exc
 
-        message = f"posted manifest diff comment to {repo} pull request #{pull_request}"
-        logger.info("diff complete: %s", message)
+        logger.info(
+            "diff complete: posted manifest diff comment to %s pull request #%s",
+            repo,
+            pull_request,
+        )
         report(
             "commented",
-            message,
+            f"commented on {short_repo(repo)} pull request #{pull_request}",
             repo=repo,
             pull_request=pull_request,
             url=url,
@@ -999,9 +1085,8 @@ def _report_stage(stage: ChangeStage, report: Callable[..., None]) -> None:
     """Announce a rollout stage, where there is a rollout to announce it for."""
     if stage.rollout is None:
         return
-    message = (
-        f"{stage.label}: deploying {', '.join(output.name for output in stage.outputs)}"
-    )
+    names = join_names([output.name for output in stage.outputs])
+    message = f"rollout {stage.rollout}, {stage.label}: {names}"
     logger.info("change step 4/7: %s", message)
     report(
         "rollout-stage",
@@ -1117,26 +1202,121 @@ def object_ref_payloads(
     ]
 
 
+def short_repo(repo: str) -> str:
+    """Name a repository the way someone talking about it would: owner/name.
+
+    The scheme and host are the same for every repository relcoord touches, so
+    they are noise in a line meant to be read. The full URL stays in the detail
+    of the event and in the log.
+    """
+    trimmed = repo.rstrip("/").removesuffix(".git")
+    path = trimmed.rpartition("://")[2]
+    parts = path.split("/")
+    return "/".join(parts[-2:]) if len(parts) > 1 else path
+
+
+def short_commit(commit: str) -> str:
+    """Abbreviate a commit to the length git itself shows."""
+    return commit[:SHORT_COMMIT_LENGTH]
+
+
+def join_names(names: Sequence[str]) -> str:
+    """Join names as a sentence does, so a list of two reads as a pair."""
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _describe_ref(ref: KubernetesObjectRef) -> str:
+    """Name a Kubernetes object as kubectl would talk about it."""
+    if ref.namespace is None:
+        return f"{ref.kind} {ref.name}"
+    return f"{ref.kind} {ref.namespace}/{ref.name}"
+
+
+def _describe_refs(refs: Sequence[KubernetesObjectRef]) -> str:
+    """List objects, cut short where a change touched more than a reader wants.
+
+    Every object is in the detail of the event, so the cut costs nothing but the
+    line's length.
+    """
+    shown = ", ".join(_describe_ref(ref) for ref in refs[:MAX_REPORTED_OBJECTS])
+    remaining = len(refs) - MAX_REPORTED_OBJECTS
+    return shown if remaining <= 0 else f"{shown} and {remaining} more"
+
+
+def _deploy_config_message(
+    namespace: str | None, config_path: str, system: bool
+) -> str:
+    """Say what the config commit is being generated as, rather than from where.
+
+    The directory it was found in is a path inside a temporary workspace, so what
+    is worth reading is the owner the manifests are generated as: the whole
+    repository as system, or one namespace from its own config directory.
+    """
+    if system:
+        return "generating as system from the repository root"
+    return f"generating for namespace {namespace} from {config_path}"
+
+
+def _stage_verified_message(
+    stage: ChangeStage, observed: Sequence[tuple[str, float]]
+) -> str:
+    """Report what a stage's gate observed, or that it had nothing to wait for."""
+    if not observed:
+        names = join_names([output.name for output in stage.outputs])
+        return f"{stage.label} skipped: {names} unaffected"
+    if len(observed) == 1:
+        name, seconds = observed[0]
+        return f"{stage.label} verified: {name} picked it up after {seconds:.1f}s"
+    picked_up = join_names(
+        [f"{name} after {seconds:.1f}s" for name, seconds in observed]
+    )
+    return f"{stage.label} verified: picked up by {picked_up}"
+
+
+def _generating_message(output: OutputSettings, declares_targets: bool) -> str:
+    """Say what is being generated, in the terms the config repository uses."""
+    if not declares_targets:
+        return f"generating manifests for output {output.name}"
+    target = output.target_name
+    if target == output.name:
+        return f"generating manifests for target {target}"
+    return f"generating manifests for target {target} into {output.name}"
+
+
+def _generated_message(
+    output: OutputSettings,
+    generated: int,
+    created_or_modified: Sequence[KubernetesObjectRef],
+    removed: Sequence[KubernetesObjectRef],
+) -> str:
+    """Report what a generation changed, rather than how much it wrote.
+
+    An output is generated in full every time, so the count of files written says
+    how large the target is and not what the commit did to it. The count that
+    answers the second question leads, with the first one behind it as the
+    reassurance that the whole target was rendered.
+    """
+    if not created_or_modified and not removed:
+        return f"{output.name}: none of {generated} manifests changed"
+    parts = [f"{len(created_or_modified)} of {generated} manifests changed"]
+    if removed:
+        parts.append(f"{len(removed)} removed")
+    return f"{output.name}: {', '.join(parts)}"
+
+
 def _changed_objects_message(
     output: OutputSettings,
     created_or_modified: Sequence[KubernetesObjectRef],
     removed: Sequence[KubernetesObjectRef],
-    deploy_id: str | None,
 ) -> str:
     parts = []
     if created_or_modified:
-        parts.append(
-            "created or modified "
-            + ", ".join(_format_ref(ref) for ref in created_or_modified)
-        )
+        parts.append(f"updated {_describe_refs(created_or_modified)}")
     if removed:
-        parts.append("removed " + ", ".join(_format_ref(ref) for ref in removed))
-    cluster_name = _cluster_name(output)
-    cluster = f" in cluster {cluster_name}" if cluster_name else ""
-    return (
-        f"output {output.name}{cluster} {'; '.join(parts)} "
-        f"(deploy-id {deploy_id or '<none>'})"
-    )
+        parts.append(f"removed {_describe_refs(removed)}")
+    return f"{output.name}: {'; '.join(parts)}"
 
 
 def _cluster_name(output: OutputSettings) -> str | None:
@@ -1326,11 +1506,12 @@ def _external_plugins(
     if plugins_repository is None or system:
         return None
     plugins = _checkout_plugins(plugins_repository, workdir / "plugins", idcat)
-    message = f"checked out plugins from {plugins.source}"
-    logger.info("%s: %s", step, message)
+    logger.info("%s: checked out plugins from %s", step, plugins.source)
+    _, _, plugins_commit = plugins.source.rpartition("@")
     report(
         "plugins-checkout",
-        message,
+        f"using plugins from {short_repo(plugins_repository)} "
+        f"at {short_commit(plugins_commit)}",
         repository=plugins_repository,
         source=plugins.source,
     )

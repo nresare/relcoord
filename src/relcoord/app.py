@@ -30,7 +30,10 @@ from relcoord.change import (
     ProgressSink,
     RolloutStageError,
     ignore_progress,
+    join_names,
     object_ref_payloads,
+    short_commit,
+    short_repo,
 )
 from relcoord.errors import (
     PersistenceUnavailableError,
@@ -677,11 +680,24 @@ def _diff_completion(plan: _DiffPlan, result: object) -> dict[str, Any]:
         comment["posted"] if comment is not None else False,
     )
     return {
+        "message": _diff_summary(payload),
         "config_repo": plan.repo,
         "commit": plan.commit,
         "pull_request": plan.pull_request,
         **payload,
     }
+
+
+def _diff_summary(payload: dict[str, Any]) -> str:
+    """Say what a diff came to: what changed, and where the comment went."""
+    changed = sum(1 for diff in payload["diffs"] if diff["diff"].strip())
+    comment = payload["comment"]
+    posted = comment is not None and comment["posted"]
+    if not changed:
+        return "no manifest changes" + (", commented" if posted else "")
+    repositories = "repository" if changed == 1 else "repositories"
+    summary = f"{changed} manifests {repositories} would change"
+    return f"{summary}, commented" if posted else summary
 
 
 def _diff_result_payload(result: object) -> dict[str, Any]:
@@ -752,11 +768,28 @@ def _change_completion(plan: _ChangePlan, result: object) -> dict[str, Any]:
     )
     logger.info("Accepted change for repo %s at commit %s", plan.repo, plan.commit)
     return {
+        "message": _change_summary(processed),
         "config_repo": plan.repo,
         "commit": plan.commit,
         "registered": plan.registered,
         "processed": processed,
     }
+
+
+def _change_summary(processed: dict[str, Any]) -> str:
+    """Say what a change came to, for a client that prints one line per event.
+
+    An output the commit did not affect generated nothing and was not pushed, so
+    what is worth naming is where the change actually went.
+    """
+    deployed = [
+        output["name"]
+        for output in processed["outputs"]
+        if output["created_or_modified"] or output["removed"]
+    ]
+    if not deployed:
+        return "no manifest changes to deploy"
+    return f"deployed to {join_names(deployed)}"
 
 
 def _report_change_failure(
@@ -856,6 +889,9 @@ def _change_events(
     return _work_events(
         _StreamedWork(
             accepted={
+                "message": (
+                    f"change to {short_repo(plan.repo)} at {short_commit(plan.commit)}"
+                ),
                 "config_repo": plan.repo,
                 "commit": plan.commit,
                 "registered": plan.registered,
@@ -881,6 +917,9 @@ def _diff_events(
     return _work_events(
         _StreamedWork(
             accepted={
+                "message": (
+                    f"diff of {short_repo(plan.repo)} at {short_commit(plan.commit)}"
+                ),
                 "config_repo": plan.repo,
                 "commit": plan.commit,
                 "pull_request": plan.pull_request,

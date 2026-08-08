@@ -49,6 +49,7 @@ The `200` response body reports the diff and the comment:
 
 ```json
 {
+  "message": "1 manifests repository would change, commented",
   "config_repo": "https://github.com/example/system",
   "commit": "deadbeef",
   "pull_request": 42,
@@ -72,7 +73,7 @@ shows. `diffs[].diff` is always the unabridged diff, which is where the comment
 points a reader who needs the part it left out.
 
 `Accept: text/event-stream` works here too, with the same event shapes as
-`/v1/change` and phases `workspace`, `source-checkout`, `deploy-config`,
+`/v1/change` and phases `source-checkout`, `deploy-config`, `plugins-checkout`,
 `manifests-checkout`, `generate`, `generated`, `diff`, `no-changes`, `comment`,
 `commented` and `no-comment`.
 
@@ -91,16 +92,27 @@ curl -N -H 'accept: text/event-stream' -H 'content-type: application/json' \
 
 The stream carries four kinds of event:
 
-- `accepted` — sent immediately, with `config_repo`, `commit` and the `registered`
-  image version, so the client can render something before any git work starts.
-- `progress` — one per step, with a stable `phase` (`workspace`,
-  `source-checkout`, `deploy-config`, `rollout-stage`, `manifests-checkout`,
-  `generate`, `generated`, `no-changes`, `commit`, `push`, `pushed`,
+- `accepted` — sent immediately, with a `message`, `config_repo`, `commit` and the
+  `registered` image version, so the client can render something before any git
+  work starts.
+- `progress` — one per step, with a stable `phase` (`source-checkout`,
+  `deploy-config`, `plugins-checkout`, `rollout-stage`, `manifests-checkout`,
+  `generate`, `generated`, `changed-objects`, `no-changes`, `push`, `pushed`,
   `deployment-detection`, `rollout-stage-verified`),
   a human readable `message`, and a `detail` object with specifics of the step.
-- `complete` — the same body the non-streaming response would have returned.
+- `complete` — the same body the non-streaming response would have returned,
+  whose `message` says where the change was deployed.
 - `error` — a change that failed, carrying the `status`, `error` and `message`
   that the non-streaming response would have used.
+
+Every event carries a `message` written to be read on its own, so a client can
+print the stream as it arrives without knowing any payload shape. What a message
+leaves out is in `detail`: the temporary workspace, the full commit hashes, the
+deploy-id, every changed object where the message named the first few. A step
+whose only interest is to whoever debugs relcoord — the temporary directory it
+works in, the manifests commit named by the push lines either side of it — is
+logged rather than streamed, which is why there is no `workspace` or `commit`
+phase.
 
 Comment lines (`: keep-alive`) are sent while a step is slow, so intermediate
 proxies do not treat the connection as dead.

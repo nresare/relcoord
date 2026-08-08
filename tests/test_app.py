@@ -353,6 +353,7 @@ def test_change_without_image_and_tag_acknowledges_without_registering(
 
     assert response.status_code == 202
     assert response.json() == {
+        "message": "no manifest changes to deploy",
         "config_repo": "acme/config",
         "commit": "deadbeef",
         "registered": None,
@@ -410,6 +411,7 @@ def test_change_processes_deploy_config_when_processor_is_configured(
     assert response.status_code == 202
     assert processor.calls == [("https://github.com/acme/config.git", "deadbeef", None)]
     assert response.json() == {
+        "message": "no manifest changes to deploy",
         "config_repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
         "registered": None,
@@ -1149,12 +1151,12 @@ def test_change_streams_progress_when_client_accepts_event_stream() -> None:
         [
             ChangeProgress(
                 phase="source-checkout",
-                message="checking out source repo acme/config at commit deadbeef",
+                message="checking out acme/config at deadbee",
                 detail={"repo": "acme/config", "commit": "deadbeef"},
             ),
             ChangeProgress(
                 phase="generated",
-                message="manifest-builder generated 2 file(s) for output manifests",
+                message="manifests: 2 of 2 manifests changed",
                 detail={"generated": 2},
             ),
         ]
@@ -1192,11 +1194,12 @@ def test_change_streams_progress_when_client_accepts_event_stream() -> None:
 
     assert events[1][1] == {
         "phase": "source-checkout",
-        "message": "checking out source repo acme/config at commit deadbeef",
+        "message": "checking out acme/config at deadbee",
         "detail": {"repo": "acme/config", "commit": "deadbeef"},
     }
     assert events[2][1]["phase"] == "generated"
     assert events[3][1] == {
+        "message": "no manifest changes to deploy",
         "config_repo": "acme/config",
         "commit": "deadbeef",
         "registered": registered,
@@ -1429,6 +1432,7 @@ def test_change_returns_json_when_event_stream_is_not_accepted() -> None:
     assert response.status_code == 202
     assert response.headers["content-type"] == "application/json"
     assert response.json() == {
+        "message": "no manifest changes to deploy",
         "config_repo": "acme/config",
         "commit": "deadbeef",
         "registered": None,
@@ -1878,6 +1882,7 @@ def test_diffcomment_streams_progress_when_client_accepts_event_stream() -> None
         "complete",
     ]
     assert events[0][1] == {
+        "message": "diff of acme/config at deadbee",
         "config_repo": "https://github.com/acme/config",
         "commit": "deadbeef",
         "pull_request": 7,

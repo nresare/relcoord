@@ -194,7 +194,6 @@ def test_diff_reports_progress_for_each_step(
     ).diff(CONFIG_REPO, "deadbeef", pull_request=7, progress=events.append)
 
     assert [event.phase for event in events] == [
-        "workspace",
         "source-checkout",
         "deploy-config",
         "manifests-checkout",
@@ -209,7 +208,10 @@ def test_diff_reports_progress_for_each_step(
         "repo": CONFIG_REPO,
         "commit": "deadbeef",
     }
+    assert by_phase["source-checkout"].message == "checking out acme/config at deadbee"
     assert by_phase["diff"].detail == {"repository": MANIFESTS_REPO, "changed": 1}
+    assert by_phase["diff"].message == "acme/manifests: 1 file changed"
+    assert by_phase["commented"].message == "commented on acme/config pull request #7"
     assert by_phase["commented"].detail["pull_request"] == 7
     assert by_phase["commented"].detail["url"] == (
         "https://github.com/acme/config/pull/7#c1"
