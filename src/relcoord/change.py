@@ -23,7 +23,7 @@ from manifest_builder.config import (
     load_toml_file,
 )
 
-from relcoord.config import IdcatSettings, OutputSettings
+from relcoord.config import IdcatSettings, OutputSettings, RolloutSettings
 from relcoord.git import GitCredentialError, GitCredentials, github_https_credentials
 from relcoord.github import GithubCommentError, GithubIssueCommenter, IssueCommenter
 from relcoord.kubernetes import KubernetesDeploymentDetector, KubernetesObjectRef
@@ -83,6 +83,15 @@ class GitTransportError(ChangeProcessingError):
 
 class DeploymentDetectionError(ChangeProcessingError):
     pass
+
+
+class RolloutStageError(DeploymentDetectionError):
+    """Raised when a rollout stage's deployment was not observed.
+
+    What the stage pushed stays pushed and the stages after it are not started,
+    so this reports on the deployment rather than on a fault in relcoord, and is
+    reported without a stack trace.
+    """
 
 
 class CommentPostError(ChangeProcessingError):
@@ -156,6 +165,30 @@ class OutputResult:
     cluster: str | None = None
     created_or_modified: tuple[KubernetesObjectRef, ...] = ()
     removed: tuple[KubernetesObjectRef, ...] = ()
+    rollout: str | None = None
+    """Rollout that deployed this output, absent without [[rollout]] entries."""
+    stage: int | None = None
+    """One-based position of this output's stage within its rollout."""
+
+
+@dataclass(frozen=True)
+class ChangeStage:
+    """One step of the plan a change is deployed in.
+
+    ``rollout`` is None for the single stage of a deployment that configures no
+    rollouts, where every output is deployed together and nothing gates anything.
+    """
+
+    outputs: tuple[OutputSettings, ...]
+    rollout: str | None = None
+    index: int = 1
+    count: int = 1
+
+    @property
+    def label(self) -> str:
+        if self.rollout is None:
+            return "all outputs"
+        return f"rollout {self.rollout} stage {self.index}/{self.count}"
 
 
 @dataclass(frozen=True)
@@ -164,6 +197,8 @@ class ChangeProcessor:
     plugins_repository: str | None = None
     """Repository whose ``plugins`` directory parses non-system config."""
     outputs: Sequence[OutputSettings] = ()
+    rollouts: Sequence[RolloutSettings] = ()
+    """Pipelines the outputs are deployed in, one stage at a time."""
     idcat: IdcatSettings | None = None
     detect_deployment: bool = False
     deployment_detector: DeploymentDetector | None = None
@@ -225,181 +260,56 @@ class ChangeProcessor:
                 step="change step 3/7",
             )
 
-            repo_root = Path("/")
-            create_commit = True
             output_results: list[OutputResult] = []
             total_generated = 0
+            cloned: set[str] = set()
 
-            for repository, manifests_checkout in checkout_by_repository.items():
-                detection_results: list[tuple[OutputSettings, GenerationResult]] = []
-                message = f"checking out manifests repo {repository} into {manifests_checkout}"
-                logger.info("change step 4/7: %s", message)
-                report("manifests-checkout", message, repository=repository)
-                _clone_repository(
-                    repository,
-                    manifests_checkout,
-                    self.idcat,
-                    purpose=f"cloning manifests repo {repository}",
-                    depth="1",
-                )
+            for stage in _change_stages(output_settings, self.rollouts):
+                _report_stage(stage, report)
+                stage_results: list[tuple[OutputSettings, GenerationResult]] = []
 
-                for output in _outputs_for_repository(output_settings, repository):
-                    output_path = manifests_checkout / output.directory
-                    output_path.mkdir(parents=True, exist_ok=True)
-                    selection = _generate_selection(output, declares_targets)
-                    logger.info(
-                        "change step 5/7: invoking manifest-builder generate("
-                        "output=%s, deploy_config=%s, manifests_checkout=%s, "
-                        "repo_root=%s, create_commit=%s, image=%s, namespace=%s, "
-                        "plugins=%s, %s)",
-                        output.name,
-                        deploy_config,
-                        output_path,
-                        repo_root,
-                        create_commit,
-                        image,
-                        namespace,
-                        _plugins_log_summary(plugins),
-                        _selection_log_summary(selection),
-                    )
-                    report(
-                        "generate",
-                        f"invoking manifest-builder for output {output.name}",
-                        output=output.name,
-                        repository=repository,
-                        directory=str(output.directory),
-                        **_selection_detail(selection),
-                    )
-                    generation_result = generate(
-                        deploy_config,
-                        output_path,
-                        repo_root=repo_root,
-                        create_commit=create_commit,
-                        image=image,
-                        namespace=namespace,
-                        plugins=plugins,
-                        **selection,
-                    )
-                    generated = _written_paths(generation_result)
-                    message = (
-                        f"manifest-builder generated {len(generated)} file(s) "
-                        f"for output {output.name}"
-                    )
-                    logger.info("change step 5/7: %s", message)
-                    report(
-                        "generated",
-                        message,
-                        output=output.name,
-                        repository=repository,
-                        generated=len(generated),
-                    )
-                    deploy_id = _deploy_id(generation_result)
-                    if self.detect_deployment and deploy_id is None:
-                        raise DeploymentDetectionError(
-                            "manifest-builder did not return a deploy_id; "
-                            "deployment detection requires git-backed generation"
-                        )
-                    created_or_modified = _sorted_refs(
-                        generation_result.created_or_modified
-                    )
-                    removed_refs = _sorted_refs(generation_result.removed)
-                    if created_or_modified or removed_refs:
-                        message = _changed_objects_message(
-                            output, created_or_modified, removed_refs, deploy_id
-                        )
-                        logger.info("change step 5/7: %s", message)
-                        report(
-                            "changed-objects",
-                            message,
-                            output=output.name,
-                            repository=repository,
-                            cluster=_cluster_name(output),
-                            deploy_id=deploy_id,
-                            created_or_modified=object_ref_payloads(
-                                created_or_modified
-                            ),
-                            removed=object_ref_payloads(removed_refs),
-                        )
-                    output_results.append(
-                        OutputResult(
-                            name=output.name,
-                            repository=output.repository,
-                            directory=output.directory,
+                for repository, outputs in _outputs_by_repository(stage.outputs):
+                    manifests_checkout = checkout_by_repository[repository]
+                    if repository not in cloned:
+                        self._clone_manifests(repository, manifests_checkout, report)
+                        cloned.add(repository)
+                    generation_results: list[GenerationResult] = []
+
+                    for output in outputs:
+                        output_result, generation_result = self._generate_output(
+                            output,
+                            stage,
+                            deploy_config=deploy_config,
                             manifests_checkout=manifests_checkout,
-                            generated_count=len(generated),
-                            deploy_id=deploy_id,
-                            cluster=_cluster_name(output),
-                            created_or_modified=created_or_modified,
-                            removed=removed_refs,
+                            declares_targets=declares_targets,
+                            image=image,
+                            namespace=namespace,
+                            plugins=plugins,
+                            report=report,
                         )
-                    )
-                    detection_results.append((output, generation_result))
-                    total_generated += len(generated)
+                        output_results.append(output_result)
+                        generation_results.append(generation_result)
+                        stage_results.append((output, generation_result))
+                        total_generated += output_result.generated_count
 
-                if not any(
-                    result.created_or_modified or result.removed
-                    for _, result in detection_results
-                ):
-                    message = (
-                        f"manifest-builder produced no changes for repo {repository}; "
-                        "nothing to commit or push"
-                    )
-                    logger.info("change step 6/7: %s", message)
-                    report("no-changes", message, repository=repository)
-                    continue
+                    if not any(
+                        result.created_or_modified or result.removed
+                        for result in generation_results
+                    ):
+                        message = (
+                            f"manifest-builder produced no changes for repo "
+                            f"{repository}; nothing to commit or push"
+                        )
+                        logger.info("change step 6/7: %s", message)
+                        report("no-changes", message, repository=repository)
+                        continue
 
-                manifest_commit = _head_commit(manifests_checkout)
-                message = f"manifest-builder created manifests commit {manifest_commit}"
-                logger.info("change step 6/7: %s", message)
-                report(
-                    "commit",
-                    message,
-                    repository=repository,
-                    manifest_commit=manifest_commit,
-                )
-                message = f"pushing manifests commit {manifest_commit} to {repository}"
-                logger.info("change step 7/7: %s", message)
-                report(
-                    "push",
-                    message,
-                    repository=repository,
-                    manifest_commit=manifest_commit,
-                )
-                _push_repository(
-                    manifests_checkout,
-                    repository,
-                    self.idcat,
-                )
-                message = (
-                    f"pushed manifests commit {manifest_commit} for source repo "
-                    f"{repo} at commit {commit}"
-                )
-                logger.info("change complete: %s", message)
-                report(
-                    "pushed",
-                    message,
-                    repository=repository,
-                    manifest_commit=manifest_commit,
-                )
+                    self._push_manifests(
+                        repository, manifests_checkout, repo, commit, report
+                    )
 
                 if self.detect_deployment:
-                    for output, generation_result in detection_results:
-                        deploy_id = _deploy_id(generation_result)
-                        connection = self._connection_for(output)
-                        report(
-                            "deployment-detection",
-                            "waiting for deployment of manifest-builder deploy-id "
-                            f"{deploy_id} in cluster {output.name}",
-                            deploy_id=deploy_id,
-                            output=output.name,
-                            cluster=output.name,
-                        )
-                        _start_deployment_detection(
-                            generation_result,
-                            deploy_id,
-                            connection,
-                            self.deployment_detector,
-                        )
+                    self._detect_stage_deployments(stage, stage_results, report)
             return ChangeResult(
                 repo=repo,
                 commit=commit,
@@ -418,6 +328,241 @@ class ChangeProcessor:
 
     def _configured_outputs(self) -> tuple[OutputSettings, ...]:
         return _resolve_output_settings(self.outputs, self.manifests_repository)
+
+    def _clone_manifests(
+        self,
+        repository: str,
+        manifests_checkout: Path,
+        report: Callable[..., None],
+    ) -> None:
+        """Check out a manifests repository, once per change.
+
+        The stages of a rollout generate into the same checkout, each committing
+        on top of what the stage before it committed, and push what they added.
+        """
+        message = f"checking out manifests repo {repository} into {manifests_checkout}"
+        logger.info("change step 4/7: %s", message)
+        report("manifests-checkout", message, repository=repository)
+        _clone_repository(
+            repository,
+            manifests_checkout,
+            self.idcat,
+            purpose=f"cloning manifests repo {repository}",
+            depth="1",
+        )
+
+    def _generate_output(
+        self,
+        output: OutputSettings,
+        stage: ChangeStage,
+        *,
+        deploy_config: Path,
+        manifests_checkout: Path,
+        declares_targets: bool,
+        image: str | None,
+        namespace: str | None,
+        plugins: ExternalPlugins | None,
+        report: Callable[..., None],
+    ) -> tuple[OutputResult, GenerationResult]:
+        """Let manifest-builder write one output into the manifests checkout."""
+        repo_root = Path("/")
+        create_commit = True
+        output_path = manifests_checkout / output.directory
+        output_path.mkdir(parents=True, exist_ok=True)
+        selection = _generate_selection(output, declares_targets)
+        logger.info(
+            "change step 5/7: invoking manifest-builder generate("
+            "output=%s, deploy_config=%s, manifests_checkout=%s, "
+            "repo_root=%s, create_commit=%s, image=%s, namespace=%s, "
+            "plugins=%s, %s)",
+            output.name,
+            deploy_config,
+            output_path,
+            repo_root,
+            create_commit,
+            image,
+            namespace,
+            _plugins_log_summary(plugins),
+            _selection_log_summary(selection),
+        )
+        report(
+            "generate",
+            f"invoking manifest-builder for output {output.name}",
+            output=output.name,
+            repository=output.repository,
+            directory=str(output.directory),
+            **_selection_detail(selection),
+        )
+        generation_result = generate(
+            deploy_config,
+            output_path,
+            repo_root=repo_root,
+            create_commit=create_commit,
+            image=image,
+            namespace=namespace,
+            plugins=plugins,
+            **selection,
+        )
+        generated = _written_paths(generation_result)
+        message = (
+            f"manifest-builder generated {len(generated)} file(s) "
+            f"for output {output.name}"
+        )
+        logger.info("change step 5/7: %s", message)
+        report(
+            "generated",
+            message,
+            output=output.name,
+            repository=output.repository,
+            generated=len(generated),
+        )
+        deploy_id = _deploy_id(generation_result)
+        if self.detect_deployment and deploy_id is None:
+            raise DeploymentDetectionError(
+                "manifest-builder did not return a deploy_id; "
+                "deployment detection requires git-backed generation"
+            )
+        created_or_modified = _sorted_refs(generation_result.created_or_modified)
+        removed_refs = _sorted_refs(generation_result.removed)
+        if created_or_modified or removed_refs:
+            message = _changed_objects_message(
+                output, created_or_modified, removed_refs, deploy_id
+            )
+            logger.info("change step 5/7: %s", message)
+            report(
+                "changed-objects",
+                message,
+                output=output.name,
+                repository=output.repository,
+                cluster=_cluster_name(output),
+                deploy_id=deploy_id,
+                created_or_modified=object_ref_payloads(created_or_modified),
+                removed=object_ref_payloads(removed_refs),
+            )
+        return (
+            OutputResult(
+                name=output.name,
+                repository=output.repository,
+                directory=output.directory,
+                manifests_checkout=manifests_checkout,
+                generated_count=len(generated),
+                deploy_id=deploy_id,
+                cluster=_cluster_name(output),
+                created_or_modified=created_or_modified,
+                removed=removed_refs,
+                rollout=stage.rollout,
+                stage=stage.index if stage.rollout is not None else None,
+            ),
+            generation_result,
+        )
+
+    def _push_manifests(
+        self,
+        repository: str,
+        manifests_checkout: Path,
+        repo: str,
+        commit: str,
+        report: Callable[..., None],
+    ) -> None:
+        """Push what manifest-builder committed for one stage of one repository."""
+        manifest_commit = _head_commit(manifests_checkout)
+        message = f"manifest-builder created manifests commit {manifest_commit}"
+        logger.info("change step 6/7: %s", message)
+        report(
+            "commit",
+            message,
+            repository=repository,
+            manifest_commit=manifest_commit,
+        )
+        message = f"pushing manifests commit {manifest_commit} to {repository}"
+        logger.info("change step 7/7: %s", message)
+        report(
+            "push",
+            message,
+            repository=repository,
+            manifest_commit=manifest_commit,
+        )
+        _push_repository(
+            manifests_checkout,
+            repository,
+            self.idcat,
+        )
+        message = (
+            f"pushed manifests commit {manifest_commit} for source repo "
+            f"{repo} at commit {commit}"
+        )
+        logger.info("change complete: %s", message)
+        report(
+            "pushed",
+            message,
+            repository=repository,
+            manifest_commit=manifest_commit,
+        )
+
+    def _detect_stage_deployments(
+        self,
+        stage: ChangeStage,
+        results: Sequence[tuple[OutputSettings, GenerationResult]],
+        report: Callable[..., None],
+    ) -> None:
+        """Follow a stage's pushes into the clusters they were pushed to.
+
+        A rollout waits here, because the stages after this one are gated on what
+        it observes: a deployment that never materialises has to stop the change
+        rather than only reach the log. Without a rollout there is nothing to
+        gate, so detection runs in the background as it always has and the change
+        answers as soon as the manifests are pushed.
+
+        An output the commit did not affect generated nothing, so there is no
+        deployment of it to wait for and its cluster is left alone.
+        """
+        deployed = [
+            (output, result)
+            for output, result in results
+            if result.created_or_modified or result.removed
+        ]
+        for output, generation_result in deployed:
+            deploy_id = _deploy_id(generation_result)
+            connection = self._connection_for(output)
+            report(
+                "deployment-detection",
+                "waiting for deployment of manifest-builder deploy-id "
+                f"{deploy_id} in cluster {output.name}",
+                deploy_id=deploy_id,
+                output=output.name,
+                cluster=output.name,
+            )
+            if stage.rollout is None:
+                _start_deployment_detection(
+                    generation_result,
+                    deploy_id,
+                    connection,
+                    self.deployment_detector,
+                )
+            else:
+                _await_deployment_detection(
+                    generation_result,
+                    deploy_id,
+                    connection,
+                    self.deployment_detector,
+                )
+        if stage.rollout is None:
+            return
+        names = ", ".join(output.name for output, _ in deployed)
+        message = (
+            f"{stage.label}: deployment observed in {names}"
+            if deployed
+            else f"{stage.label}: nothing deployed, moving on"
+        )
+        logger.info("change step 7/7: %s", message)
+        report(
+            "rollout-stage-verified",
+            message,
+            rollout=stage.rollout,
+            stage=stage.index,
+            stages=stage.count,
+            outputs=[output.name for output, _ in deployed],
+        )
 
     def _connection_for(self, output: OutputSettings) -> OutputSettings | None:
         """Return the connection for an output's deployment destination.
@@ -835,6 +980,71 @@ def _outputs_for_repository(
     return tuple(output for output in outputs if output.repository == repository)
 
 
+def _outputs_by_repository(
+    outputs: Sequence[OutputSettings],
+) -> tuple[tuple[str, tuple[OutputSettings, ...]], ...]:
+    """Group outputs by the manifests repository they are generated into.
+
+    One checkout serves every output of a repository, and one push sends what
+    they generated, so a change works a repository at a time within each stage.
+    """
+    repositories = list(dict.fromkeys(output.repository for output in outputs))
+    return tuple(
+        (repository, _outputs_for_repository(outputs, repository))
+        for repository in repositories
+    )
+
+
+def _report_stage(stage: ChangeStage, report: Callable[..., None]) -> None:
+    """Announce a rollout stage, where there is a rollout to announce it for."""
+    if stage.rollout is None:
+        return
+    message = (
+        f"{stage.label}: deploying {', '.join(output.name for output in stage.outputs)}"
+    )
+    logger.info("change step 4/7: %s", message)
+    report(
+        "rollout-stage",
+        message,
+        rollout=stage.rollout,
+        stage=stage.index,
+        stages=stage.count,
+        outputs=[output.name for output in stage.outputs],
+    )
+
+
+def _change_stages(
+    outputs: Sequence[OutputSettings], rollouts: Sequence[RolloutSettings]
+) -> tuple[ChangeStage, ...]:
+    """Order the outputs into the stages a change deploys them in.
+
+    Rollouts are walked in the order they are configured, one at a time, so that
+    a change deploys and verifies in an order the configuration states rather
+    than one that depends on how the work happens to interleave.
+    """
+    if not rollouts:
+        return (ChangeStage(outputs=tuple(outputs)),)
+    by_name = {output.name: output for output in outputs}
+    stages: list[ChangeStage] = []
+    for rollout in rollouts:
+        for index, stage in enumerate(rollout.stages, start=1):
+            missing = [name for name in stage.outputs if name not in by_name]
+            if missing:
+                raise ChangeProcessingError(
+                    f"rollout '{rollout.name}' stage {index} names unconfigured "
+                    f"output(s) {', '.join(missing)}"
+                )
+            stages.append(
+                ChangeStage(
+                    outputs=tuple(by_name[name] for name in stage.outputs),
+                    rollout=rollout.name,
+                    index=index,
+                    count=len(rollout.stages),
+                )
+            )
+    return tuple(stages)
+
+
 def _declares_targets(deploy_config: Path) -> bool:
     """Report whether a config directory declares targets.
 
@@ -964,6 +1174,67 @@ def _start_deployment_detection(
         daemon=True,
     )
     thread.start()
+
+
+def _await_deployment_detection(
+    generation_result: GenerationResult,
+    deploy_id: str | None,
+    connection: OutputSettings | None,
+    detector: DeploymentDetector | None,
+) -> None:
+    """Wait for a deployment, raising when it does not arrive.
+
+    This is the gate between the stages of a rollout, so unlike the background
+    detection of a change without one, a failure is reported to the caller: it
+    is what stops the stages after this one from being pushed.
+    """
+    if deploy_id is None:
+        raise DeploymentDetectionError(
+            "manifest-builder did not return a deploy_id; "
+            "deployment detection requires git-backed generation"
+        )
+    owned_detector: KubernetesDeploymentDetector | None = None
+    active_detector: DeploymentDetector
+    if detector is not None:
+        active_detector = detector
+    else:
+        if connection is None:
+            raise DeploymentDetectionError(
+                f"deployment detection for manifest-builder deploy-id {deploy_id} "
+                "has no cluster and no detector to observe it with"
+            )
+        try:
+            owned_detector = KubernetesDeploymentDetector.for_output(connection)
+        except Exception as exc:
+            raise RolloutStageError(
+                f"could not connect to cluster {connection.name} to detect the "
+                f"deployment of manifest-builder deploy-id {deploy_id}: {exc}"
+            ) from exc
+        active_detector = owned_detector
+    logger.info(
+        "waiting for deployment of manifest-builder deploy-id %s in cluster %s",
+        deploy_id,
+        connection.name if connection is not None else "<injected detector>",
+    )
+    try:
+        active_detector.wait_for_success(
+            deploy_id=deploy_id,
+            created_or_modified=set(generation_result.created_or_modified),
+            removed=set(generation_result.removed),
+        )
+    except Exception as exc:
+        raise RolloutStageError(
+            f"deployment of manifest-builder deploy-id {deploy_id} was not "
+            f"observed: {exc}"
+        ) from exc
+    else:
+        logger.info(
+            "deployment detected for manifest-builder deploy-id %s",
+            deploy_id,
+        )
+    finally:
+        if owned_detector is not None:
+            owned_detector.close()
 
 
 def _run_deployment_detection(

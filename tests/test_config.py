@@ -866,3 +866,315 @@ def test_settings_rejects_detect_deployment_with_manifests_repository(
 
     with pytest.raises(ValueError, match="detect-deployment requires"):
         Settings.from_toml(config)
+
+
+ROLLOUT_OUTPUTS = """
+detect-deployment = true
+
+[[output]]
+name = "platform-dev"
+repository = "https://github.com/acme/manifests"
+connection-type = "local"
+
+[[output]]
+name = "platform-prod"
+repository = "https://github.com/acme/manifests"
+connection-type = "local"
+
+[[output]]
+name = "observability"
+repository = "https://github.com/acme/manifests"
+connection-type = "local"
+"""
+
+
+def _rollout_config(tmp_path: Path, rollouts: str) -> Path:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(ROLLOUT_OUTPUTS + rollouts)
+    return config
+
+
+def test_settings_parse_rollout_stages(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev"]
+
+        [[rollout.stage]]
+        outputs = ["platform-prod", "observability"]
+        """,
+    )
+
+    settings = Settings.from_toml(config)
+
+    assert [rollout.name for rollout in settings.rollouts] == ["linear"]
+    rollout = settings.rollouts[0]
+    assert [stage.outputs for stage in rollout.stages] == [
+        ("platform-dev",),
+        ("platform-prod", "observability"),
+    ]
+    assert rollout.output_names == (
+        "platform-dev",
+        "platform-prod",
+        "observability",
+    )
+
+
+def test_settings_default_to_no_rollouts(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "example-dev"
+        repository = "https://github.com/acme/manifests"
+        """
+    )
+
+    assert Settings.from_toml(config).rollouts == []
+
+
+def test_settings_reject_rollout_without_detect_deployment(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        [[output]]
+        name = "platform-dev"
+        repository = "https://github.com/acme/manifests"
+
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev"]
+        """
+    )
+
+    with pytest.raises(ValueError, match=r"\[\[rollout\]\] requires detect-deployment"):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_rollout_without_outputs(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text(
+        """
+        detect-deployment = true
+        manifests-repository = "https://github.com/acme/manifests"
+
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["manifests"]
+        """
+    )
+
+    with pytest.raises(
+        ValueError, match=r"\[\[rollout\]\] requires \[\[output\]\] entries"
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_rollout_naming_an_unconfigured_output(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev"]
+
+        [[rollout.stage]]
+        outputs = ["platform-prod", "observability", "platform-staging"]
+        """,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "rollout 'linear' names output 'platform-staging', which is not "
+            "configured; expected one of observability, platform-dev, platform-prod"
+        ),
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_an_output_in_two_stages_of_one_rollout(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev"]
+
+        [[rollout.stage]]
+        outputs = ["platform-dev", "platform-prod", "observability"]
+        """,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "output 'platform-dev' appears in more than one stage of rollout 'linear'"
+        ),
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_an_output_in_two_rollouts(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev"]
+
+        [[rollout.stage]]
+        outputs = ["platform-prod"]
+
+        [[rollout]]
+        name = "observability"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev"]
+
+        [[rollout.stage]]
+        outputs = ["observability"]
+        """,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "output 'platform-dev' appears in more than one rollout stage; "
+            "also in rollout 'linear'"
+        ),
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_an_output_outside_every_rollout(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev"]
+
+        [[rollout.stage]]
+        outputs = ["platform-prod"]
+        """,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "every output must appear in a rollout stage once rollouts are "
+            "configured; observability does not"
+        ),
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_duplicate_rollout_names(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["platform-dev", "platform-prod"]
+
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        outputs = ["observability"]
+        """,
+    )
+
+    with pytest.raises(ValueError, match="duplicate rollout 'linear'"):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_a_rollout_without_a_name(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+
+        [[rollout.stage]]
+        outputs = ["platform-dev", "platform-prod", "observability"]
+        """,
+    )
+
+    with pytest.raises(ValueError, match="rollout.name must be a non-empty string"):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_a_rollout_without_stages(tmp_path: Path) -> None:
+    config = _rollout_config(
+        tmp_path,
+        """
+        [[rollout]]
+        name = "linear"
+        """,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"rollout 'linear' must declare at least one \[\[rollout.stage\]\]",
+    ):
+        Settings.from_toml(config)
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [
+        pytest.param("outputs = []", id="empty"),
+        pytest.param('outputs = "platform-dev"', id="string"),
+        pytest.param("outputs = [1]", id="not-a-name"),
+        pytest.param("", id="missing"),
+    ],
+)
+def test_settings_reject_a_stage_without_output_names(
+    tmp_path: Path, outputs: str
+) -> None:
+    config = _rollout_config(
+        tmp_path,
+        f"""
+        [[rollout]]
+        name = "linear"
+
+        [[rollout.stage]]
+        {outputs}
+        """,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "rollout 'linear' stage 1: outputs must be a non-empty array of "
+            "output names"
+        ),
+    ):
+        Settings.from_toml(config)
+
+
+def test_settings_reject_a_rollout_that_is_not_a_table(tmp_path: Path) -> None:
+    config = tmp_path / "relcoord.toml"
+    config.write_text('rollout = ["linear"]\n' + ROLLOUT_OUTPUTS)
+
+    with pytest.raises(TypeError, match="each rollout entry must be a table"):
+        Settings.from_toml(config)

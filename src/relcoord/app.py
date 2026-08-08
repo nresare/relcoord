@@ -28,6 +28,7 @@ from relcoord.change import (
     DeployConfigError,
     GitTransportError,
     ProgressSink,
+    RolloutStageError,
     ignore_progress,
     object_ref_payloads,
 )
@@ -732,6 +733,8 @@ def _change_result_payload(result: object) -> dict[str, Any]:
                 "deploy_id": output.deploy_id,
                 "created_or_modified": object_ref_payloads(output.created_or_modified),
                 "removed": object_ref_payloads(output.removed),
+                "rollout": getattr(output, "rollout", None),
+                "stage": getattr(output, "stage", None),
             }
             for output in getattr(result, "outputs", ())
         ],
@@ -811,6 +814,15 @@ def _report_processing_failure(
             exc,
         )
         return 502, "git_transport_failed", str(exc)
+    if isinstance(exc, RolloutStageError):
+        logger.warning(
+            "Rollout stopped while processing %s for repo %s at commit %s: %s",
+            action,
+            repo,
+            commit,
+            exc,
+        )
+        return 502, "rollout_stage_failed", str(exc)
     logger.error(
         "Failed to process %s for repo %s at commit %s",
         action,

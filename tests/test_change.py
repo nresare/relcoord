@@ -13,6 +13,7 @@ from manifest_builder import ExternalPlugins
 
 from relcoord import change
 from relcoord.change import (
+    ChangeProcessingError,
     ChangeProcessor,
     ChangeProgress,
     CredentialError,
@@ -20,8 +21,9 @@ from relcoord.change import (
     DeploymentDetectionError,
     GitTransportError,
     PluginsRepositoryError,
+    RolloutStageError,
 )
-from relcoord.config import OutputSettings
+from relcoord.config import OutputSettings, RolloutSettings, RolloutStage
 from relcoord.git import GitCredentialError
 
 
@@ -1344,3 +1346,261 @@ def test_change_processor_rejects_detection_without_a_cluster(
             "https://github.com/acme/manifests.git",
             detect_deployment=True,
         ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+
+ROLLOUT_REPOSITORY = "https://github.com/acme/manifests.git"
+
+ROLLOUT_OUTPUTS = [
+    OutputSettings(
+        name="platform-dev",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-dev"),
+    ),
+    OutputSettings(
+        name="platform-prod",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-prod"),
+    ),
+    OutputSettings(
+        name="observability",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("observability"),
+    ),
+]
+
+# platform-dev first, then the two outputs that wait for it.
+LINEAR_ROLLOUT = RolloutSettings(
+    name="linear",
+    stages=(
+        RolloutStage(outputs=("platform-dev",)),
+        RolloutStage(outputs=("platform-prod", "observability")),
+    ),
+)
+
+
+def _staged_change_processor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    changed: set[str],
+    failing: frozenset[str] = frozenset(),
+) -> tuple[ChangeProcessor, list[str]]:
+    """A processor whose outputs generate changes only where ``changed`` says.
+
+    The recorded calls are what a rollout is about: which outputs were generated
+    and pushed, and in what order that interleaved with waiting for the
+    deployments to be observed. Each output's deploy-id names it, so a wait says
+    which output it was waiting for.
+    """
+    calls: list[str] = []
+
+    class Detector:
+        def wait_for_success(
+            self, *, deploy_id: str, created_or_modified: set, removed: set
+        ) -> None:
+            calls.append(f"verify:{deploy_id}")
+            if deploy_id in failing:
+                raise RuntimeError(f"{deploy_id} never reached the cluster")
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        calls.append("clone")
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path, output_path: Path, **kwargs
+    ) -> GenerationResult:
+        name = output_path.name
+        calls.append(f"generate:{name}")
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified=(
+                {Ref(kind="Deployment", namespace="config", name=name)}
+                if name in changed
+                else set()
+            ),
+            removed=set(),
+            deploy_id=f"deploy-{name}",
+        )
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append("push")
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    processor = ChangeProcessor(
+        outputs=ROLLOUT_OUTPUTS,
+        rollouts=[LINEAR_ROLLOUT],
+        detect_deployment=True,
+        deployment_detector=Detector(),
+    )
+    return processor, calls
+
+
+def test_rollout_waits_for_each_stage_before_deploying_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _staged_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"platform-dev", "platform-prod", "observability"},
+    )
+
+    result = processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert calls == [
+        "clone",
+        "generate:platform-dev",
+        "push",
+        "verify:deploy-platform-dev",
+        "generate:platform-prod",
+        "generate:observability",
+        "push",
+        "verify:deploy-platform-prod",
+        "verify:deploy-observability",
+    ]
+    assert [
+        (output.name, output.rollout, output.stage) for output in result.outputs
+    ] == [
+        ("platform-dev", "linear", 1),
+        ("platform-prod", "linear", 2),
+        ("observability", "linear", 2),
+    ]
+
+
+def test_rollout_skips_a_stage_whose_outputs_the_change_does_not_affect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _staged_change_processor(
+        tmp_path, monkeypatch, changed={"observability"}
+    )
+
+    processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert calls == [
+        "clone",
+        "generate:platform-dev",
+        "generate:platform-prod",
+        "generate:observability",
+        "push",
+        "verify:deploy-observability",
+    ]
+
+
+def test_rollout_stops_at_a_stage_whose_deployment_is_not_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _staged_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"platform-dev", "platform-prod", "observability"},
+        failing=frozenset({"deploy-platform-dev"}),
+    )
+
+    with pytest.raises(
+        RolloutStageError,
+        match="deployment of manifest-builder deploy-id deploy-platform-dev "
+        "was not observed: deploy-platform-dev never reached the cluster",
+    ):
+        processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert calls == [
+        "clone",
+        "generate:platform-dev",
+        "push",
+        "verify:deploy-platform-dev",
+    ]
+
+
+def test_rollout_reports_progress_for_each_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, _ = _staged_change_processor(
+        tmp_path, monkeypatch, changed={"platform-dev", "observability"}
+    )
+
+    events: list[ChangeProgress] = []
+    processor.process(
+        "https://github.com/acme/config.git", "deadbeef", None, progress=events.append
+    )
+
+    assert [event.phase for event in events] == [
+        "workspace",
+        "source-checkout",
+        "deploy-config",
+        "rollout-stage",
+        "manifests-checkout",
+        "generate",
+        "generated",
+        "changed-objects",
+        "commit",
+        "push",
+        "pushed",
+        "deployment-detection",
+        "rollout-stage-verified",
+        "rollout-stage",
+        "generate",
+        "generated",
+        "generate",
+        "generated",
+        "changed-objects",
+        "commit",
+        "push",
+        "pushed",
+        "deployment-detection",
+        "rollout-stage-verified",
+    ]
+    stages = [event for event in events if event.phase == "rollout-stage"]
+    assert [event.detail for event in stages] == [
+        {
+            "rollout": "linear",
+            "stage": 1,
+            "stages": 2,
+            "outputs": ["platform-dev"],
+        },
+        {
+            "rollout": "linear",
+            "stage": 2,
+            "stages": 2,
+            "outputs": ["platform-prod", "observability"],
+        },
+    ]
+    verified = [event for event in events if event.phase == "rollout-stage-verified"]
+    assert [event.message for event in verified] == [
+        "rollout linear stage 1/2: deployment observed in platform-dev",
+        "rollout linear stage 2/2: deployment observed in observability",
+    ]
+
+
+def test_change_stages_without_rollouts_deploy_every_output_at_once() -> None:
+    stages = change._change_stages(ROLLOUT_OUTPUTS, ())
+
+    assert len(stages) == 1
+    assert stages[0].rollout is None
+    assert [output.name for output in stages[0].outputs] == [
+        "platform-dev",
+        "platform-prod",
+        "observability",
+    ]
+
+
+def test_change_stages_reject_an_unconfigured_output() -> None:
+    rollout = RolloutSettings(
+        name="linear", stages=(RolloutStage(outputs=("platform-staging",)),)
+    )
+
+    with pytest.raises(
+        ChangeProcessingError,
+        match="rollout 'linear' stage 1 names unconfigured output\\(s\\) "
+        "platform-staging",
+    ):
+        change._change_stages(ROLLOUT_OUTPUTS, (rollout,))

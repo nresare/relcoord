@@ -217,6 +217,37 @@ class OutputSettings:
 
 
 @dataclass(frozen=True)
+class RolloutStage:
+    """One step of a rollout: the outputs deployed before the next step starts."""
+
+    outputs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RolloutSettings:
+    """An ordered pipeline of stages over the outputs it names.
+
+    A change deploys the outputs of the first stage, waits until each of those
+    deployments has been observed in its cluster, and only then moves on to the
+    next stage, so a deployment that fails to materialise in one stage stops the
+    stages after it.
+
+    Which outputs a change affects is not configured here: an output whose
+    manifests the config commit leaves alone generates no changes, so it is
+    skipped and its stage has nothing to wait for. A change to a section only
+    the last stage's outputs are built from therefore reaches them immediately,
+    while a change to a section every output shares walks the whole pipeline.
+    """
+
+    name: str
+    stages: tuple[RolloutStage, ...]
+
+    @property
+    def output_names(self) -> tuple[str, ...]:
+        return tuple(name for stage in self.stages for name in stage.outputs)
+
+
+@dataclass(frozen=True)
 class Settings:
     listen: str = "0.0.0.0"
     port: int = 8000
@@ -224,6 +255,7 @@ class Settings:
     manifests_repository: str | None = None
     plugins_repository: str | None = None
     outputs: list[OutputSettings] = field(default_factory=list)
+    rollouts: list[RolloutSettings] = field(default_factory=list)
     diff_output: str | None = None
     detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
@@ -255,6 +287,11 @@ class Settings:
         if not isinstance(raw_outputs, list):
             raise TypeError("output must be an array of tables")
         outputs = _outputs_from_entries(raw_outputs)
+        raw_rollouts = data.get("rollout", [])
+        if not isinstance(raw_rollouts, list):
+            raise TypeError("rollout must be an array of tables")
+        rollouts = _rollouts_from_entries(raw_rollouts)
+        _check_rollout_outputs(rollouts, outputs)
         if "cluster" in data:
             raise ValueError(
                 "[[cluster]] entries are not supported; put connection settings "
@@ -270,6 +307,7 @@ class Settings:
             data, "detect-deployment", cls.detect_deployment
         )
         _check_deployment_outputs(outputs, detect_deployment)
+        _check_rollout_detection(rollouts, detect_deployment)
         roles: list[RoleConfig] = []
         seen: set[str] = set()
         for entry in raw_roles:
@@ -292,6 +330,7 @@ class Settings:
             manifests_repository=manifests_repository,
             plugins_repository=_optional_string(data, "plugins-repository"),
             outputs=outputs,
+            rollouts=rollouts,
             diff_output=diff_output,
             detect_deployment=detect_deployment,
             persistence=(
@@ -378,6 +417,112 @@ def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:
         seen.add(output.name)
         outputs.append(output)
     return outputs
+
+
+def _rollouts_from_entries(entries: list[Any]) -> list[RolloutSettings]:
+    rollouts: list[RolloutSettings] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise TypeError("each rollout entry must be a table")
+        rollout = _rollout_from_mapping(entry)
+        if rollout.name in seen:
+            raise ValueError(f"duplicate rollout '{rollout.name}'")
+        seen.add(rollout.name)
+        rollouts.append(rollout)
+    return rollouts
+
+
+def _rollout_from_mapping(data: dict[str, Any]) -> RolloutSettings:
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("rollout.name must be a non-empty string")
+    raw_stages = data.get("stage")
+    if raw_stages is None:
+        raise ValueError(
+            f"rollout '{name}' must declare at least one [[rollout.stage]]"
+        )
+    if not isinstance(raw_stages, list):
+        raise TypeError("rollout.stage must be an array of tables")
+    if not raw_stages:
+        raise ValueError(
+            f"rollout '{name}' must declare at least one [[rollout.stage]]"
+        )
+    stages: list[RolloutStage] = []
+    for index, entry in enumerate(raw_stages, start=1):
+        if not isinstance(entry, dict):
+            raise TypeError("each rollout.stage entry must be a table")
+        stages.append(RolloutStage(outputs=_stage_outputs(entry, name, index)))
+    return RolloutSettings(name=name, stages=tuple(stages))
+
+
+def _stage_outputs(data: dict[str, Any], rollout: str, index: int) -> tuple[str, ...]:
+    value = data.get("outputs")
+    if not isinstance(value, list) or not value:
+        raise ValueError(
+            f"rollout '{rollout}' stage {index}: outputs must be a non-empty "
+            "array of output names"
+        )
+    names: list[str] = []
+    for name in value:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"rollout '{rollout}' stage {index}: outputs must be a non-empty "
+                "array of output names"
+            )
+        names.append(name)
+    return tuple(names)
+
+
+def _check_rollout_outputs(
+    rollouts: list[RolloutSettings], outputs: list[OutputSettings]
+) -> None:
+    """Check that the rollouts and the outputs describe the same deployment.
+
+    Each output is deployed by one rollout stage and no other, so that no two
+    stages push to a cluster at once, and every output belongs to a stage, so
+    that adding a rollout cannot leave an output deploying outside it.
+    """
+    if not rollouts:
+        return
+    if not outputs:
+        raise ValueError(
+            "[[rollout]] requires [[output]] entries; manifests-repository does "
+            "not name the outputs a rollout stages"
+        )
+    configured = {output.name for output in outputs}
+    staged: dict[str, str] = {}
+    for rollout in rollouts:
+        for name in rollout.output_names:
+            if name not in configured:
+                raise ValueError(
+                    f"rollout '{rollout.name}' names output '{name}', which is not "
+                    f"configured; expected one of {', '.join(sorted(configured))}"
+                )
+            if name in staged:
+                where = (
+                    f"stage of rollout '{rollout.name}'"
+                    if staged[name] == rollout.name
+                    else f"rollout stage; also in rollout '{staged[name]}'"
+                )
+                raise ValueError(f"output '{name}' appears in more than one {where}")
+            staged[name] = rollout.name
+    unstaged = sorted(configured - set(staged))
+    if unstaged:
+        raise ValueError(
+            "every output must appear in a rollout stage once rollouts are "
+            f"configured; {', '.join(unstaged)} does not"
+        )
+
+
+def _check_rollout_detection(
+    rollouts: list[RolloutSettings], detect_deployment: bool
+) -> None:
+    if rollouts and not detect_deployment:
+        raise ValueError(
+            "[[rollout]] requires detect-deployment = true; a stage waits for the "
+            "deployment it pushed to be observed before the next stage starts"
+        )
 
 
 def _check_deployment_outputs(

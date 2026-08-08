@@ -63,6 +63,26 @@ cluster_name = "example-prod"
 account_id = 444455556666
 issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEPRODCLUSTERID"
 
+# The order the outputs above are deployed in. Each stage is pushed and then
+# waited for, so example-prod is only deployed once the change has been observed
+# in example-dev. An output a change does not affect generates nothing, so it is
+# skipped rather than waited for: a change only example-prod is built from finds
+# the first stage empty and reaches example-prod straight away.
+#
+# Every output has to appear in exactly one stage of one rollout, and rollouts
+# require detect-deployment = true, since a stage waits for what it pushed.
+# Without any [[rollout]], every output is deployed at once and detection runs in
+# the background, which is what a deployment that wants no ordering configures.
+#
+# [[rollout]]
+# name = "linear"
+#
+# [[rollout.stage]]
+# outputs = ["example-dev"]
+#
+# [[rollout.stage]]
+# outputs = ["example-prod"]
+
 # EKS connections sign a presigned STS GetCallerIdentity URL as relcoord's own
 # identity, so the cluster needs an access entry for relcoord's IAM role, and
 # that role may live in another account.

@@ -94,8 +94,9 @@ The stream carries four kinds of event:
 - `accepted` — sent immediately, with `config_repo`, `commit` and the `registered`
   image version, so the client can render something before any git work starts.
 - `progress` — one per step, with a stable `phase` (`workspace`,
-  `source-checkout`, `deploy-config`, `manifests-checkout`, `generate`,
-  `generated`, `no-changes`, `commit`, `push`, `pushed`, `deployment-detection`),
+  `source-checkout`, `deploy-config`, `rollout-stage`, `manifests-checkout`,
+  `generate`, `generated`, `no-changes`, `commit`, `push`, `pushed`,
+  `deployment-detection`, `rollout-stage-verified`),
   a human readable `message`, and a `detail` object with specifics of the step.
 - `complete` — the same body the non-streaming response would have returned.
 - `error` — a change that failed, carrying the `status`, `error` and `message`
@@ -277,3 +278,55 @@ relcoord-eks-kubeconfig example-dev --region eu-west-1 \
   --endpoint https://EXAMPLEDEVCLUSTERID.gr7.eu-west-1.eks.amazonaws.com \
   --ca-file /etc/relcoord/example-dev-ca.pem
 ```
+
+## Rollouts
+
+Without a rollout, a change deploys every output at once: the manifests are
+pushed, and relcoord follows each deployment into its cluster in the background.
+A `[[rollout]]` puts an order on that instead. Its stages are deployed one at a
+time, and a stage is not started until every deployment of the stage before it
+has been observed in its cluster:
+
+```toml
+detect-deployment = true
+
+[[rollout]]
+name = "linear"
+
+[[rollout.stage]]
+outputs = ["platform-dev"]
+
+[[rollout.stage]]
+outputs = ["platform-prod", "observability"]
+```
+
+Which outputs a change affects is not configured. An output whose manifests the
+config commit leaves alone generates no changes, so it is not pushed and there is
+no deployment of it to wait for — it drops out of the rollout for that change.
+That is what makes one pipeline serve config repositories whose targets are built
+from different sections: a change to a section every target shares walks the
+whole pipeline, dev first, while a change to a section only `observability` is
+built from finds the first stage empty and reaches `observability` straight away.
+
+Because a stage waits, `[[rollout]]` requires `detect-deployment = true`. Every
+output must appear in exactly one stage of one rollout: an output named twice
+would have two stages pushing to one cluster, and an output named nowhere would
+deploy outside the rollout that was configured to order it. Rollouts are walked
+in the order they are configured, one at a time, so several rollouts express
+pipelines that are independent rather than pipelines that run concurrently.
+
+A deployment a stage waits for and does not observe within the detection timeout
+fails the change with `rollout_stage_failed`, and the stages after it are neither
+generated nor pushed. What earlier stages pushed stays pushed, which is the point
+of deploying to `platform-dev` first.
+
+A rollout therefore holds a `/v1/change` request open for as long as the whole
+pipeline takes, waiting included. `Accept: text/event-stream` is the way to watch
+it happen: `rollout-stage` reports the stage being deployed and
+`rollout-stage-verified` the outputs whose deployment it observed, and the
+`outputs` of the response say which rollout and stage each output was deployed
+by.
+
+Outputs sharing a manifests repository are pushed as one commit per stage rather
+than one commit per change, since a stage cannot push what a later stage has not
+generated yet.

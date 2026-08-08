@@ -28,6 +28,7 @@ from relcoord.change import (
     DeployConfigError,
     GitTransportError,
     ProgressSink,
+    RolloutStageError,
     ignore_progress,
 )
 from relcoord.errors import PersistenceUnavailableError
@@ -685,6 +686,58 @@ def test_change_reports_git_transport_error_without_traceback(
         "https://github.com/acme/config.git at commit deadbeef" in caplog.text
     )
     # The error must be reported without dumping a stack trace.
+    assert "Traceback (most recent call last)" not in caplog.text
+
+
+def test_change_reports_a_stopped_rollout_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Processor:
+        def process(
+            self,
+            repo: str,
+            commit: str,
+            image: str | None,
+            config_path: str = ".deploy",
+            system: bool = False,
+            *,
+            progress: ProgressSink = ignore_progress,
+        ) -> object:
+            raise RolloutStageError(
+                "deployment of manifest-builder deploy-id feedface was not "
+                "observed: timed out after 300s waiting for Deployment/api"
+            )
+
+    client = TestClient(
+        create_app(
+            InMemoryImageInfoStore(),
+            token_validator=NoopTokenValidator(),
+            change_processor=Processor(),
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="relcoord.app")
+
+    response = client.post(
+        "/v1/change",
+        json={
+            "config_repo": "https://github.com/acme/config.git",
+            "commit": "deadbeef",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": "rollout_stage_failed",
+        "message": (
+            "deployment of manifest-builder deploy-id feedface was not observed: "
+            "timed out after 300s waiting for Deployment/api"
+        ),
+    }
+    assert (
+        "Rollout stopped while processing change for repo "
+        "https://github.com/acme/config.git at commit deadbeef" in caplog.text
+    )
+    # A stage that does not verify reports on the deployment, not on relcoord.
     assert "Traceback (most recent call last)" not in caplog.text
 
 
