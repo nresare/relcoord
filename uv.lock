@@ -524,7 +524,7 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.7.3"
+version = "0.7.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -533,7 +533,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4a/ee/0b86917bd9406bd759c05cb0a4cc457104f3909610ab877b3b2ab7c717eb/manifest_builder-0.7.3-py3-none-any.whl", hash = "sha256:68b4108f4d59e63f35e4831a2ddb485c279e60d70387a7a32ef370e343d84c3f", size = 45351, upload-time = "2026-08-08T07:58:25.897Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/35/ae2e7d594c783ea8ea87c917c60e138871a7fd70070ac756ced3dcb2235b/manifest_builder-0.7.4-py3-none-any.whl", hash = "sha256:c937707bfc665aa96e640945c23d7e20f54185bade682871ca156775270a7d8f", size = 45469, upload-time = "2026-08-08T13:01:55.365Z" },
 ]
 
 [[package]]
@@ -820,7 +820,6 @@ wheels = [
 
 [[package]]
 name = "relcoord"
-version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
@@ -852,7 +851,7 @@ requires-dist = [
     { name = "dulwich" },
     { name = "httpx" },
     { name = "hypercorn" },
-    { name = "manifest-builder", specifier = ">=0.7.3", index = "https://pypi.org/simple" },
+    { name = "manifest-builder", specifier = ">=0.7.4", index = "https://pypi.org/simple" },
     { name = "pyjwt", extras = ["crypto"] },
     { name = "pyyaml" },
     { name = "starlette" },

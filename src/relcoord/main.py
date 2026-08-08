@@ -25,6 +25,7 @@ from relcoord.in_memory_store import InMemoryImageInfoStore
 from relcoord.retrying_store import RetryingImageInfoStore
 from relcoord.store import ImageInfoStore
 from relcoord.surreal_store import SurrealImageInfoStore
+from relcoord.version import version_summary
 
 DEFAULT_CONFIG_PATH = "/config/relcoord.toml"
 LOG_FORMAT = "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s: %(message)s"
@@ -110,6 +111,19 @@ def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
     )
 
 
+def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+    """Report both versions and exit, before --config is looked for.
+
+    The option is eager so that ``--version`` answers wherever it is run: the
+    default config path only exists in the container, and click would otherwise
+    reject the invocation for the missing file before printing anything.
+    """
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(version_summary())
+    ctx.exit()
+
+
 @click.command()
 @click.option(
     "-c",
@@ -126,9 +140,18 @@ def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
     default=False,
     help="Disable bearer-token authentication on write endpoints.",
 )
+@click.option(
+    "--version",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_print_version,
+    help="Print the running release and the manifest-builder it uses, and exit.",
+)
 def main(config_path: str, disable_auth: bool) -> None:
     settings = Settings.from_toml(config_path)
     configure_logging(settings.log_level)
+    logger.info("Starting %s", version_summary())
     asyncio.run(run(settings, disable_auth))
 
 

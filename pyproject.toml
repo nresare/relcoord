@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relcoord"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Image version service for relcoord."
 readme = "README.md"
 license = "MIT"
@@ -16,7 +16,7 @@ dependencies = [
   "dulwich",
   "httpx",
   "hypercorn",
-  "manifest-builder>=0.7.3",
+  "manifest-builder>=0.7.4",
   "pyjwt[crypto]",
   "pyyaml",
   "starlette",
@@ -52,6 +52,9 @@ manifest-builder = { index = "upstream" }
 [project.scripts]
 relcoord = "relcoord.main:main"
 relcoord-eks-kubeconfig = "relcoord.eks:main"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/relcoord"]

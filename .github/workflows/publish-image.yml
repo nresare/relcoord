@@ -21,6 +21,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          # The image tag names the nearest reachable vX.Y.Z tag, and finding it
+          # takes the tags and the history between them and HEAD, neither of which
+          # a shallow checkout has.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -33,8 +38,15 @@ jobs:
       - name: Compute Docker image tag
         id: image-version
         run: |
-          image_version="$(uv run --locked --group dev bktools-image-version-hash)"
+          # <nearest reachable vX.Y.Z>-<hash of the build context>, which is what
+          # bktools pipelinegen tags a container with too.
+          image_version="$(uv run --locked --group dev bktools-image-version-hash --tag)"
           echo "tag=public.ecr.aws/q3z6g1h3/relcoord:${image_version}" >> "$GITHUB_OUTPUT"
+          echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
+          # The version is the tag without the trailing build hash. Taking it from
+          # the same string keeps the version in the image and the version in its
+          # tag from disagreeing.
+          echo "version=${image_version%-*}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
@@ -60,3 +72,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.image-version.outputs.tag }}
+          build-args: |
+            RELCOORD_VERSION=${{ steps.image-version.outputs.version }}
+            RELCOORD_IMAGE_TAG=${{ steps.image-version.outputs.image_version }}

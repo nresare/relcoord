@@ -114,6 +114,32 @@ regular status code and JSON body, whatever the client accepts.
 Disconnecting does not cancel a change in progress; the server finishes the work
 and logs the outcome.
 
+## Versions
+
+`--version` reports the running release and the manifest-builder it generates
+manifests with, and the same line is logged at startup:
+
+```bash
+relcoord --version
+```
+
+```
+relcoord 0.1.0-38225f79 (manifest-builder 0.7.4)
+```
+
+In a container image that is the tag the image was published under: the nearest
+reachable `vX.Y.Z` git tag and a hash of the build context, which together name
+one build rather than only the release it came from. The publish workflow passes
+it to the build, which writes it to `/usr/share/relcoord/image-tag` — the final
+image has no shell to write it with, and nothing mounts over `/usr/share`, unlike
+`/etc/relcoord`, where a mounted CA certificate would hide it.
+
+Outside a container image there is no tag, and the version is the one the package
+was built with. That comes from the same nearest reachable git tag, via
+`hatch-vcs`, so a checkout reports something like `0.1.1.dev103+g3269f1e`. The
+container build has no `.git` to read — copying it in would rebuild the layers
+above it on every commit — so the workflow passes the version in as well.
+
 ## Development
 
 Run the test suite:
