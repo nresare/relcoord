@@ -16,7 +16,7 @@ dependencies = [
   "dulwich",
   "httpx",
   "hypercorn",
-  "manifest-builder",
+  "manifest-builder>=0.7.3",
   "pyjwt[crypto]",
   "pyyaml",
   "starlette",
@@ -35,7 +35,19 @@ dev = [
 
 
 [[tool.uv.index]]
+name = "reposnake"
 url = "https://repo.noa.re/"
+
+[[tool.uv.index]]
+name = "upstream"
+url = "https://pypi.org/simple"
+
+# manifest-builder is released to PyPI, but reposnake still carries older
+# versions of it. Naming the index here keeps first-index-match in force for
+# every other dependency, rather than letting the whole resolution fall back to
+# whichever index happens to hold the newest version.
+[tool.uv.sources]
+manifest-builder = { index = "upstream" }
 
 [project.scripts]
 relcoord = "relcoord.main:main"

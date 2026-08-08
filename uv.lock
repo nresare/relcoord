@@ -524,8 +524,8 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.7.1"
-source = { registry = "https://repo.noa.re/" }
+version = "0.7.3"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "dulwich" },
@@ -533,7 +533,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://repo.noa.re/manifest-builder/manifest_builder-0.7.1-py3-none-any.whl", hash = "sha256:2afbe6df9bf2b34a42452d5e54d41765c8cd3ad501608d3b153e21194445c5b0", size = 44006 },
+    { url = "https://files.pythonhosted.org/packages/4a/ee/0b86917bd9406bd759c05cb0a4cc457104f3909610ab877b3b2ab7c717eb/manifest_builder-0.7.3-py3-none-any.whl", hash = "sha256:68b4108f4d59e63f35e4831a2ddb485c279e60d70387a7a32ef370e343d84c3f", size = 45351, upload-time = "2026-08-08T07:58:25.897Z" },
 ]
 
 [[package]]
@@ -852,7 +852,7 @@ requires-dist = [
     { name = "dulwich" },
     { name = "httpx" },
     { name = "hypercorn" },
-    { name = "manifest-builder" },
+    { name = "manifest-builder", specifier = ">=0.7.3", index = "https://pypi.org/simple" },
     { name = "pyjwt", extras = ["crypto"] },
     { name = "pyyaml" },
     { name = "starlette" },

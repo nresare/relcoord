@@ -91,6 +91,7 @@ def make_change_processor(
         )
     return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
+        plugins_repository=settings.plugins_repository,
         outputs=settings.outputs,
         idcat=settings.idcat,
         detect_deployment=settings.detect_deployment,
@@ -100,6 +101,7 @@ def make_change_processor(
 def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
     return DiffCommentProcessor(
         manifests_repository=settings.manifests_repository,
+        plugins_repository=settings.plugins_repository,
         outputs=settings.outputs,
         diff_output=settings.diff_output,
         idcat=settings.idcat,

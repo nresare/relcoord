@@ -222,6 +222,7 @@ class Settings:
     port: int = 8000
     log_level: str = "INFO"
     manifests_repository: str | None = None
+    plugins_repository: str | None = None
     outputs: list[OutputSettings] = field(default_factory=list)
     diff_output: str | None = None
     detect_deployment: bool = False
@@ -289,6 +290,7 @@ class Settings:
             port=data.get("port", cls.port),
             log_level=_log_level_or_default(data, "log-level", cls.log_level),
             manifests_repository=manifests_repository,
+            plugins_repository=_optional_string(data, "plugins-repository"),
             outputs=outputs,
             diff_output=diff_output,
             detect_deployment=detect_deployment,

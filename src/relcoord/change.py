@@ -15,7 +15,7 @@ from typing import Any, Protocol, cast
 from dulwich import porcelain
 from dulwich.objects import Commit, ObjectID
 from dulwich.repo import Repo
-from manifest_builder import GenerationResult, generate
+from manifest_builder import ExternalPlugins, GenerationResult, generate
 from manifest_builder.config import (
     TARGETS_VERSION,
     config_version,
@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 # with the response that asked for the comment.
 FULL_DIFF_REFERENCE = "returned in the relcoord response for this request"
 
+# Subdirectory of the configured plugins repository holding the plugin modules,
+# matching the layout manifest-builder expects of a config directory.
+PLUGINS_DIRECTORY = "plugins"
+
 
 class ChangeProcessingError(Exception):
     pass
@@ -47,6 +51,15 @@ class ChangeProcessingError(Exception):
 
 class DeployConfigError(ChangeProcessingError):
     pass
+
+
+class PluginsRepositoryError(ChangeProcessingError):
+    """Raised when the configured plugins repository has no plugins directory.
+
+    That is a relcoord configuration mistake rather than anything the change
+    request did, so it is worth naming the repository the operator configured;
+    manifest-builder would otherwise fail naming only a temporary path.
+    """
 
 
 class CredentialError(ChangeProcessingError):
@@ -148,6 +161,8 @@ class OutputResult:
 @dataclass(frozen=True)
 class ChangeProcessor:
     manifests_repository: str | None = None
+    plugins_repository: str | None = None
+    """Repository whose ``plugins`` directory parses non-system config."""
     outputs: Sequence[OutputSettings] = ()
     idcat: IdcatSettings | None = None
     detect_deployment: bool = False
@@ -201,6 +216,14 @@ class ChangeProcessor:
                 namespace=namespace,
                 targets=declares_targets,
             )
+            plugins = _external_plugins(
+                self.plugins_repository,
+                workdir,
+                system,
+                self.idcat,
+                report,
+                step="change step 3/7",
+            )
 
             repo_root = Path("/")
             create_commit = True
@@ -228,7 +251,7 @@ class ChangeProcessor:
                         "change step 5/7: invoking manifest-builder generate("
                         "output=%s, deploy_config=%s, manifests_checkout=%s, "
                         "repo_root=%s, create_commit=%s, image=%s, namespace=%s, "
-                        "%s)",
+                        "plugins=%s, %s)",
                         output.name,
                         deploy_config,
                         output_path,
@@ -236,6 +259,7 @@ class ChangeProcessor:
                         create_commit,
                         image,
                         namespace,
+                        _plugins_log_summary(plugins),
                         _selection_log_summary(selection),
                     )
                     report(
@@ -253,6 +277,7 @@ class ChangeProcessor:
                         create_commit=create_commit,
                         image=image,
                         namespace=namespace,
+                        plugins=plugins,
                         **selection,
                     )
                     generated = _written_paths(generation_result)
@@ -460,6 +485,8 @@ class DiffCommentProcessor:
     """
 
     manifests_repository: str | None = None
+    plugins_repository: str | None = None
+    """Repository whose ``plugins`` directory parses non-system config."""
     outputs: Sequence[OutputSettings] = ()
     diff_output: str | None = None
     idcat: IdcatSettings | None = None
@@ -515,6 +542,14 @@ class DiffCommentProcessor:
                 namespace=namespace,
                 targets=declares_targets,
             )
+            plugins = _external_plugins(
+                self.plugins_repository,
+                workdir,
+                system,
+                self.idcat,
+                report,
+                step="diff step 3/6",
+            )
 
             output_diffs: list[OutputDiff] = []
             repository_diffs: list[RepositoryDiff] = []
@@ -540,11 +575,12 @@ class DiffCommentProcessor:
                     logger.info(
                         "diff step 5/6: invoking manifest-builder generate("
                         "output=%s, deploy_config=%s, manifests_checkout=%s, "
-                        "namespace=%s, %s)",
+                        "namespace=%s, plugins=%s, %s)",
                         output.name,
                         deploy_config,
                         output_path,
                         namespace,
+                        _plugins_log_summary(plugins),
                         _selection_log_summary(selection),
                     )
                     report(
@@ -562,6 +598,7 @@ class DiffCommentProcessor:
                         create_commit=True,
                         image=None,
                         namespace=namespace,
+                        plugins=plugins,
                         **selection,
                     )
                     generated = _written_paths(generation_result)
@@ -823,6 +860,10 @@ def _generate_selection(
     return {"vars": output.vars}
 
 
+def _plugins_log_summary(plugins: ExternalPlugins | None) -> str:
+    return "none" if plugins is None else plugins.source
+
+
 def _selection_log_summary(selection: dict[str, Any]) -> str:
     target = selection.get("target")
     if target is not None:
@@ -994,6 +1035,61 @@ def _checkout_commit(
         no_checkout=True,
     )
     _dulwich_checkout(target, commit)
+
+
+def _external_plugins(
+    plugins_repository: str | None,
+    workdir: Path,
+    system: bool,
+    idcat: IdcatSettings | None,
+    report: Callable[..., None],
+    *,
+    step: str,
+) -> ExternalPlugins | None:
+    """Check out the configured plugins repository, for a non-system request.
+
+    System-mode config comes from a repository that carries its own plugins, so
+    the configured repository is only consulted for the ordinary case where it
+    does not.
+    """
+    if plugins_repository is None or system:
+        return None
+    plugins = _checkout_plugins(plugins_repository, workdir / "plugins", idcat)
+    message = f"checked out plugins from {plugins.source}"
+    logger.info("%s: %s", step, message)
+    report(
+        "plugins-checkout",
+        message,
+        repository=plugins_repository,
+        source=plugins.source,
+    )
+    return plugins
+
+
+def _checkout_plugins(
+    repository: str, target: Path, idcat: IdcatSettings | None
+) -> ExternalPlugins:
+    """Check out the plugins repository and describe it for manifest-builder.
+
+    The latest commit on the default branch is what gets used, and its hash goes
+    into ``source`` so the ``Plugins from:`` line of a generated commit records
+    exactly which plugins produced those manifests.
+    """
+    _clone_repository(
+        repository,
+        target,
+        idcat,
+        purpose=f"cloning plugins repo {repository}",
+        depth="1",
+    )
+    commit = _head_commit(target)
+    path = target / PLUGINS_DIRECTORY
+    if not path.is_dir():
+        raise PluginsRepositoryError(
+            f"plugins repo {repository} at commit {commit} has no "
+            f"{PLUGINS_DIRECTORY}/ directory"
+        )
+    return ExternalPlugins(path=path, source=f"{repository}@{commit}")
 
 
 def _namespace_from_repo(repo: str) -> str:

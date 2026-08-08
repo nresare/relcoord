@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from dulwich import porcelain
+from manifest_builder import ExternalPlugins
 
 from relcoord import change
 from relcoord.change import (
@@ -24,6 +25,7 @@ from relcoord.manifest_diff import ManifestDiff
 
 CONFIG_REPO = "https://github.com/acme/config.git"
 MANIFESTS_REPO = "https://github.com/acme/manifests.git"
+PLUGINS_REPO = "https://github.com/acme/plugins.git"
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ def _fake_git(
     tmp_path: Path,
     *,
     calls: list[tuple[object, ...]] | None = None,
+    captured: dict[str, object] | None = None,
     diff: ManifestDiff | None = None,
     written: int = 1,
     targets: bool = False,
@@ -83,6 +86,8 @@ def _fake_git(
     def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
         recorded.append(("clone", repo, target.name, kwargs))
         target.mkdir(parents=True)
+        if repo == PLUGINS_REPO:
+            (target / "plugins").mkdir()
 
     def fake_generate(
         deploy_config: Path,
@@ -94,7 +99,10 @@ def _fake_git(
         namespace: str | None,
         vars: dict[str, object] | None = None,
         target: str | None = None,
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
+        if captured is not None:
+            captured["plugins"] = plugins
         recorded.append(
             (
                 "generate",
@@ -460,6 +468,43 @@ def test_diff_system_mode_uses_the_repository_root(
     generate_call = next(call for call in calls if call[0] == "generate")
     assert generate_call[1] == "source"
     assert generate_call[5] is None
+
+
+def test_diff_checks_out_the_plugins_repository_and_passes_it_to_generate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    _fake_git(monkeypatch, tmp_path, captured=captured)
+
+    DiffCommentProcessor(
+        manifests_repository=MANIFESTS_REPO,
+        plugins_repository=PLUGINS_REPO,
+        commenter=Commenter(),
+    ).diff(CONFIG_REPO, "deadbeef")
+
+    assert captured["plugins"] == ExternalPlugins(
+        path=tmp_path / "plugins" / "plugins",
+        source=f"{PLUGINS_REPO}@feedface",
+    )
+
+
+def test_diff_leaves_the_plugins_repository_out_of_system_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    calls: list[tuple[object, ...]] = []
+    _fake_git(monkeypatch, tmp_path, calls=calls, captured=captured)
+
+    DiffCommentProcessor(
+        manifests_repository=MANIFESTS_REPO,
+        plugins_repository=PLUGINS_REPO,
+        commenter=Commenter(),
+    ).diff(CONFIG_REPO, "deadbeef", system=True)
+
+    assert captured["plugins"] is None
+    assert [
+        call for call in calls if call[0] == "clone" and call[1] == PLUGINS_REPO
+    ] == []
 
 
 def test_diff_requires_the_deploy_directory(

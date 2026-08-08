@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from dulwich import porcelain
 from dulwich.errors import NotGitRepository
+from manifest_builder import ExternalPlugins
 
 from relcoord import change
 from relcoord.change import (
@@ -18,6 +19,7 @@ from relcoord.change import (
     DeployConfigError,
     DeploymentDetectionError,
     GitTransportError,
+    PluginsRepositoryError,
 )
 from relcoord.config import OutputSettings
 from relcoord.git import GitCredentialError
@@ -60,6 +62,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         calls.append(
             (
@@ -179,6 +182,7 @@ def test_change_processor_reports_progress_for_each_step(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         return GenerationResult(
             written_paths={manifests_checkout / "api.yaml"},
@@ -270,6 +274,7 @@ def test_change_processor_reports_no_changes_progress(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         return GenerationResult(
             written_paths=set(),
@@ -339,6 +344,7 @@ def test_change_processor_generates_configured_outputs_with_vars(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         calls.append(
             (
@@ -500,6 +506,7 @@ def test_change_processor_generates_targets_for_a_version_2_config(
         image: str | None,
         namespace: str,
         target: str,
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         calls.append(("generate", output_path.name, target))
         return GenerationResult(
@@ -840,6 +847,7 @@ def test_change_processor_system_mode_uses_root_and_no_namespace(
         image: str | None,
         namespace: str | None,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         captured["deploy_config"] = deploy_config
         captured["namespace"] = namespace
@@ -876,6 +884,152 @@ def test_change_processor_system_mode_uses_root_and_no_namespace(
     assert captured["deploy_config"] == tmp_path / "source"
     assert captured["namespace"] is None
     assert captured["image"] is None
+
+
+def _plugins_change_fakes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured: dict[str, object],
+    *,
+    clones: list[tuple[str, Path, dict[str, object]]] | None = None,
+    plugins_dir: bool = True,
+) -> None:
+    """Fake out the git and generate calls a change makes, keeping the plugins.
+
+    The plugins repository is the one clone whose contents matter here, so its
+    checkout gets a plugins directory unless a test is about that directory
+    being missing.
+    """
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        if clones is not None:
+            clones.append((repo, target, kwargs))
+        target.mkdir(parents=True)
+        if "plugins" in repo and plugins_dir:
+            (target / "plugins").mkdir()
+
+    def fake_generate(
+        deploy_config: Path,
+        output_path: Path,
+        **kwargs,
+    ) -> GenerationResult:
+        captured["plugins"] = kwargs.get("plugins")
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified={Ref(kind="Deployment", namespace="c", name="api")},
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *args: None)
+
+
+def test_change_checks_out_the_plugins_repository_and_passes_it_to_generate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    clones: list[tuple[str, Path, dict[str, object]]] = []
+    _plugins_change_fakes(tmp_path, monkeypatch, captured, clones=clones)
+    events: list[ChangeProgress] = []
+
+    ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        plugins_repository="https://github.com/acme/plugins.git",
+    ).process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        progress=events.append,
+    )
+
+    assert captured["plugins"] == ExternalPlugins(
+        path=tmp_path / "plugins" / "plugins",
+        source="https://github.com/acme/plugins.git@feedface",
+    )
+    plugins_clone = [clone for clone in clones if "plugins" in clone[0]]
+    assert plugins_clone == [
+        (
+            "https://github.com/acme/plugins.git",
+            tmp_path / "plugins",
+            {
+                "purpose": "cloning plugins repo https://github.com/acme/plugins.git",
+                "depth": "1",
+            },
+        )
+    ]
+    checkout = [event for event in events if event.phase == "plugins-checkout"]
+    assert [event.detail["source"] for event in checkout] == [
+        "https://github.com/acme/plugins.git@feedface"
+    ]
+
+
+def test_change_leaves_the_plugins_repository_out_of_system_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    clones: list[tuple[str, Path, dict[str, object]]] = []
+
+    # System config lives at the repository root, and carries its own plugins.
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        target.mkdir(parents=True)
+
+    _plugins_change_fakes(tmp_path, monkeypatch, captured, clones=clones)
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+
+    ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        plugins_repository="https://github.com/acme/plugins.git",
+    ).process(
+        "https://github.com/acme/system.git",
+        "deadbeef",
+        None,
+        system=True,
+    )
+
+    assert captured["plugins"] is None
+    assert [clone[0] for clone in clones if "plugins" in clone[0]] == []
+
+
+def test_change_passes_no_plugins_without_a_configured_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    _plugins_change_fakes(tmp_path, monkeypatch, captured)
+
+    ChangeProcessor("https://github.com/acme/manifests.git").process(
+        "https://github.com/acme/config.git", "deadbeef", None
+    )
+
+    assert captured["plugins"] is None
+
+
+def test_change_rejects_a_plugins_repository_without_a_plugins_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    _plugins_change_fakes(tmp_path, monkeypatch, captured, plugins_dir=False)
+
+    processor = ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        plugins_repository="https://github.com/acme/plugins.git",
+    )
+    with pytest.raises(PluginsRepositoryError) as excinfo:
+        processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert str(excinfo.value) == (
+        "plugins repo https://github.com/acme/plugins.git at commit feedface "
+        "has no plugins/ directory"
+    )
 
 
 def test_dulwich_error_message_includes_action_and_parameters() -> None:
