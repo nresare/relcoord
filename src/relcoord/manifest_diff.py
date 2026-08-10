@@ -14,6 +14,10 @@ touches a shared label or annotation rewrites every manifest that has it. Those
 repeated metadata-only changes drown the interesting part of a diff, so they are
 summarized and dropped from the diff the comment carries, while the comment
 points at the full diff that the response also returns.
+
+Generated ``checksum/`` annotations are dropped the same way: they hash a
+ConfigMap or Secret so that a workload restarts when its config changes, so they
+say nothing the change to that config does not already say in the same diff.
 """
 
 from __future__ import annotations
@@ -40,6 +44,10 @@ logger = logging.getLogger(__name__)
 # GitHub rejects a longer issue comment body.
 MAX_COMMENT_CHARS = 65_536
 DEPLOY_ID_METADATA_PATH = ("metadata", "annotations", "noa.re/deploy-id")
+# Annotations under this prefix hash the config a workload mounts, so that the
+# workload restarts when the config changes. Their value is derived from a change
+# the same diff already shows, wherever in a manifest they sit.
+CHECKSUM_ANNOTATION_PREFIX = "checksum/"
 # A label or annotation that changed on this many manifests is reported as one
 # summary line instead of once per manifest.
 METADATA_SUMMARY_THRESHOLD = 2
@@ -257,6 +265,8 @@ def compare_document_metadata(
         for key in old_values.keys() | new_values.keys():
             if ("metadata", section, key) == DEPLOY_ID_METADATA_PATH:
                 continue
+            if is_checksum_key(key):
+                continue
             old = old_values.get(key)
             new = new_values.get(key)
             if old != new:
@@ -364,13 +374,43 @@ def filter_file_hunks(
     return [*header, *[line for hunk in kept_hunks for line in hunk]]
 
 
+def is_checksum_key(key: str) -> bool:
+    return key.startswith(CHECKSUM_ANNOTATION_PREFIX)
+
+
+def suppressed_yaml_paths(
+    hunk: list[str], suppress_paths: set[tuple[str, str, str]]
+) -> set[tuple[str, ...]]:
+    """Work out which of a hunk's changed paths are noise to be dropped.
+
+    A path is noise when it names a suppressed key, and so is a path whose every
+    changed child is noise: an ``annotations:`` line a manifest only gained to
+    carry a deploy-id goes the same way the deploy-id itself does.
+    """
+    changed_paths = changed_yaml_paths(hunk)
+    suppressed = {
+        path
+        for path in changed_paths
+        if path in suppress_paths or (path and is_checksum_key(path[-1]))
+    }
+    for path in sorted(changed_paths - suppressed, key=len, reverse=True):
+        held = {
+            other
+            for other in changed_paths
+            if len(other) > len(path) and other[: len(path)] == path
+        }
+        if held and held <= suppressed:
+            suppressed.add(path)
+    return suppressed
+
+
 def hunk_is_suppressed_metadata(
     hunk: list[str], suppress_paths: set[tuple[str, str, str]]
 ) -> bool:
     changed_paths = changed_yaml_paths(hunk)
     if not changed_paths:
         return False
-    return all(path in suppress_paths for path in changed_paths)
+    return changed_paths <= suppressed_yaml_paths(hunk, suppress_paths)
 
 
 def changed_yaml_paths(hunk: list[str]) -> set[tuple[str, ...]]:
@@ -398,18 +438,8 @@ def changed_yaml_paths(hunk: list[str]) -> set[tuple[str, ...]]:
 def filter_suppressed_metadata_lines(
     hunk: list[str], suppress_paths: set[tuple[str, str, str]]
 ) -> list[str]:
-    changed_paths = changed_yaml_paths(hunk)
+    suppressed_paths = suppressed_yaml_paths(hunk, suppress_paths)
     suppressed_keys = {path[-1] for path in suppress_paths}
-    suppress_parent_paths = {
-        path[:2]
-        for path in suppress_paths
-        if not any(
-            len(changed_path) > 2
-            and changed_path[:2] == path[:2]
-            and changed_path not in suppress_paths
-            for changed_path in changed_paths
-        )
-    }
     old_stack = hunk_header_yaml_stack(hunk[0])
     new_stack = hunk_header_yaml_stack(hunk[0])
     filtered = [hunk[0]]
@@ -429,13 +459,11 @@ def filter_suppressed_metadata_lines(
             continue
         stack = old_stack if marker == "-" else new_stack
         path = yaml_mapping_path(content, stack)
+        key = yaml_mapping_key(content)
         if (
-            path in suppress_paths
-            or path in suppress_parent_paths
-            or (
-                hunk_header_yaml_stack(hunk[0])
-                and yaml_mapping_key(content) in suppressed_keys
-            )
+            path in suppressed_paths
+            or (key is not None and is_checksum_key(key))
+            or (hunk_header_yaml_stack(hunk[0]) and key in suppressed_keys)
         ):
             continue
         filtered.append(line)
