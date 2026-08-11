@@ -33,6 +33,7 @@ class Ref:
     kind: str
     namespace: str | None
     name: str
+    api_version: str = "v1"
 
 
 @dataclass(frozen=True)

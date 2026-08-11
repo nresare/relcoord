@@ -65,6 +65,7 @@ class Ref:
     kind: str
     namespace: str | None
     name: str
+    api_version: str = "v1"
 
 
 def annotated(name: str, deploy_id: str | None) -> dict[str, object]:
@@ -158,7 +159,7 @@ def test_detector_returns_when_the_objects_are_already_in_place() -> None:
     detector(handler).wait_for_success(
         deploy_id=DEPLOY_ID,
         created_or_modified={
-            Ref("Deployment", "default", "api"),
+            Ref("Deployment", "default", "api", "apps/v1"),
             Ref("Namespace", None, "production"),
         },
         removed={Ref("ConfigMap", "default", "old-api")},
@@ -201,7 +202,7 @@ def test_detector_watches_until_the_deploy_id_annotation_appears(
     with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
         detector(handler).wait_for_success(
             deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api")},
+            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
             removed=set(),
         )
 
@@ -231,7 +232,7 @@ def deployments_handler(listed: dict[str, Any], *watched: dict[str, Any]):
 def wait_for_deployment(handler, *, timeout_seconds: float = 5) -> None:
     detector(handler, timeout_seconds=timeout_seconds).wait_for_success(
         deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Deployment", "default", "api")},
+        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
         removed=set(),
     )
 
@@ -416,7 +417,7 @@ def test_detector_lists_again_when_a_watch_ends_without_the_change() -> None:
 
     detector(handler).wait_for_success(
         deploy_id=DEPLOY_ID,
-        created_or_modified={Ref("Deployment", "default", "api")},
+        created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
         removed=set(),
     )
 
@@ -435,7 +436,7 @@ def test_detector_times_out_reporting_the_observed_annotation() -> None:
     with pytest.raises(DeploymentDetectionError) as excinfo:
         detector(handler, timeout_seconds=0).wait_for_success(
             deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api")},
+            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
             removed=set(),
         )
 
@@ -460,6 +461,127 @@ def test_detector_reports_a_kind_the_cluster_does_not_serve() -> None:
         )
 
 
+def shared_role_discovery(*groups: str) -> dict[str, Any]:
+    """DISCOVERY, with a namespaced Role served by each of ``groups`` at v1."""
+    discovery: dict[str, Any] = dict(DISCOVERY)
+    discovery["/apis"] = {
+        "groups": [
+            {"name": "apps", "preferredVersion": {"version": "v1"}},
+            *(
+                {"name": group, "preferredVersion": {"version": "v1"}}
+                for group in groups
+            ),
+        ]
+    }
+    for group in groups:
+        discovery[f"/apis/{group}/v1"] = {
+            "resources": [
+                {
+                    "name": "roles",
+                    "kind": "Role",
+                    "namespaced": True,
+                    "verbs": ["get", "list", "watch"],
+                }
+            ]
+        }
+    return discovery
+
+
+SHARED_ROLE_GROUPS = ("rbac.authorization.k8s.io", "iam.aws.m.upbound.io")
+
+
+@pytest.mark.parametrize("group", SHARED_ROLE_GROUPS)
+def test_detector_resolves_a_shared_kind_through_the_refs_group(group: str) -> None:
+    """A kind two groups serve resolves to the group the manifest named."""
+    discovery = shared_role_discovery(*SHARED_ROLE_GROUPS)
+    listed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        if path.startswith("/apis/") and path.endswith("/namespaces/default/roles"):
+            listed.append(path)
+            return httpx.Response(200, json=listing(annotated("api", DEPLOY_ID)))
+        return httpx.Response(500, json={"unexpected": path})
+
+    detector(handler).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={Ref("Role", "default", "api", f"{group}/v1")},
+        removed=set(),
+    )
+
+    assert listed == [f"/apis/{group}/v1/namespaces/default/roles"]
+
+
+def test_detector_resolves_a_shared_kind_whose_ref_names_another_version() -> None:
+    """Only the group has to match: one kind is one kind across its versions."""
+    discovery = shared_role_discovery("iam.aws.m.upbound.io")
+    listed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        listed.append(path)
+        return httpx.Response(200, json=listing(annotated("api", DEPLOY_ID)))
+
+    detector(handler).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={
+            Ref("Role", "default", "api", "iam.aws.m.upbound.io/v1beta1")
+        },
+        removed=set(),
+    )
+
+    assert listed == ["/apis/iam.aws.m.upbound.io/v1/namespaces/default/roles"]
+
+
+def test_detector_reports_a_kind_no_group_the_cluster_serves_defines() -> None:
+    discovery = shared_role_discovery("rbac.authorization.k8s.io")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        return httpx.Response(500, json={"unexpected": path})
+
+    with pytest.raises(DeploymentDetectionError) as excinfo:
+        detector(handler).wait_for_success(
+            deploy_id=DEPLOY_ID,
+            created_or_modified={
+                Ref("Role", "default", "api", "iam.aws.m.upbound.io/v1beta1")
+            },
+            removed=set(),
+        )
+
+    message = str(excinfo.value)
+    assert "serves no namespaced resource of kind Role" in message
+    assert "in iam.aws.m.upbound.io/v1beta1" in message
+
+
+def test_detector_reports_a_shared_kind_a_ref_carries_no_api_version_for() -> None:
+    discovery = shared_role_discovery(*SHARED_ROLE_GROUPS)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in discovery:
+            return httpx.Response(200, json=discovery[path])
+        return httpx.Response(500, json={"unexpected": path})
+
+    with pytest.raises(DeploymentDetectionError) as excinfo:
+        detector(handler).wait_for_success(
+            deploy_id=DEPLOY_ID,
+            created_or_modified={Ref("Role", "default", "api", "")},
+            removed=set(),
+        )
+
+    message = str(excinfo.value)
+    assert "kind Role (the manifest carried no apiVersion) is ambiguous" in message
+    for group in SHARED_ROLE_GROUPS:
+        assert f"/apis/{group}/v1/roles" in message
+
+
 def test_detector_reports_a_failing_api_server() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="forbidden")
@@ -467,7 +589,7 @@ def test_detector_reports_a_failing_api_server() -> None:
     with pytest.raises(DeploymentDetectionError, match="status 403"):
         detector(handler).wait_for_success(
             deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api")},
+            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
             removed=set(),
         )
 
@@ -484,7 +606,7 @@ def test_detector_reports_a_watch_that_the_api_server_rejects() -> None:
     with pytest.raises(DeploymentDetectionError, match="watch of .* status 500"):
         detector(handler).wait_for_success(
             deploy_id=DEPLOY_ID,
-            created_or_modified={Ref("Deployment", "default", "api")},
+            created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
             removed=set(),
         )
 

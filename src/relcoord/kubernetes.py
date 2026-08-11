@@ -54,6 +54,17 @@ class KubernetesObjectRef(Protocol):
     def namespace(self) -> str | None: ...
     @property
     def name(self) -> str: ...
+    @property
+    def api_version(self) -> str:
+        """The manifest's apiVersion, empty when the manifest had none.
+
+        A kind alone is not unique in a cluster: a provider CRD is free to
+        define a kind Kubernetes already defines, and iam.aws.m.upbound.io
+        defines a Role of its own alongside rbac.authorization.k8s.io. The group
+        this names is what tells the two apart when discovery is asked which
+        resource a reference means.
+        """
+        ...
 
 
 class DeploymentDetectionError(Exception):
@@ -115,6 +126,13 @@ class KubernetesResource:
         if namespace is None:
             return f"{self.path_prefix}/{self.name}"
         return f"{self.path_prefix}/namespaces/{namespace}/{self.name}"
+
+    @property
+    def group(self) -> str:
+        """The API group serving this resource, empty for the core group."""
+        parts = self.path_prefix.split("/")
+        # /apis/<group>/<version>, against /api/<version> for the core group.
+        return parts[2] if len(parts) == 4 else ""
 
 
 def cluster_client(output: OutputSettings) -> httpx.Client:
@@ -420,24 +438,40 @@ class KubernetesDeploymentDetector:
             scope = "namespaced" if ref.namespace is not None else "cluster-scoped"
             raise DeploymentDetectionError(
                 f"cluster {self._cluster_name or '<unnamed>'} serves no "
-                f"{scope} resource of kind {ref.kind}"
+                f"{scope} resource of kind {ref.kind}{_of_api_version(ref)}"
             )
         if len(resources) > 1:
             served = ", ".join(
                 f"{resource.path_prefix}/{resource.name}" for resource in resources
             )
             raise DeploymentDetectionError(
-                f"kind {ref.kind} is ambiguous in cluster "
+                f"kind {ref.kind}{_of_api_version(ref)} is ambiguous in cluster "
                 f"{self._cluster_name or '<unnamed>'}: {served}"
             )
         return resources[0]
 
     def _matching_resources(self, ref: KubernetesObjectRef) -> list[KubernetesResource]:
-        return [
+        """The resources discovery serves for a ref's kind, scope and group.
+
+        The group comes from the ref's apiVersion and is what separates a kind
+        Kubernetes defines from one a provider CRD defines under the same name.
+        Only the group is compared, not the version: discovery reports one
+        version of each group, and a kind is the same kind in all of them.
+
+        A ref carrying no apiVersion is matched on kind and scope alone, which
+        is all there is to go on. Where that leaves several resources the wait
+        fails as ambiguous rather than picking one, since a wrong pick would
+        wait for an unrelated object.
+        """
+        resources = [
             resource
             for resource in self._resources_by_kind_cached().get(ref.kind, [])
             if resource.namespaced == (ref.namespace is not None)
         ]
+        if not ref.api_version:
+            return resources
+        group = _api_group(ref.api_version)
+        return [resource for resource in resources if resource.group == group]
 
     def _resources_by_kind_cached(self) -> dict[str, list[KubernetesResource]]:
         if self._resources_by_kind is None:
@@ -703,6 +737,19 @@ def _add_resources(
                 namespaced=namespaced,
             )
         )
+
+
+def _api_group(api_version: str) -> str:
+    """The group an apiVersion names, empty for the core group's bare version."""
+    group, _, _ = api_version.rpartition("/")
+    return group
+
+
+def _of_api_version(ref: KubernetesObjectRef) -> str:
+    """Name a ref's apiVersion for an error message, saying when it had none."""
+    if not ref.api_version:
+        return " (the manifest carried no apiVersion)"
+    return f" in {ref.api_version}"
 
 
 def _format_ref(ref: KubernetesObjectRef) -> str:
