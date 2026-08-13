@@ -16,12 +16,6 @@ detect-deployment = false
 # those.
 plugins-repository = "https://github.com/example/manifest-builder-plugins"
 
-# The output that /v1/diffcomment reports on, named after one of the [[output]]
-# entries below. Only that output is generated for a diff, so a pull request
-# comment shows one cluster's manifests rather than every cluster at once.
-# Defaults to all configured outputs.
-diff-output = "example-dev"
-
 [[output]]
 name = "example-dev"
 repository = "https://github.com/example/manifests"

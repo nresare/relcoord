@@ -105,7 +105,6 @@ def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
         manifests_repository=settings.manifests_repository,
         plugins_repository=settings.plugins_repository,
         outputs=settings.outputs,
-        diff_output=settings.diff_output,
         idcat=settings.idcat,
         commenter=GithubIssueCommenter(idcat=settings.idcat),
     )

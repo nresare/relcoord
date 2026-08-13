@@ -670,16 +670,17 @@ class DiffCommentProcessor:
     in the throwaway checkout, because that is what makes the diff the one a
     change would produce, cleanups and deploy-id annotations included.
 
-    ``diff_output`` names the single output to report on, for a deployment where
-    a diff across every configured output would be more than a reviewer wants to
-    read. Every configured output is reported when it is unset.
+    Every configured output is generated, because which of them a commit affects
+    is not something the commit says: it is what generating shows. The comment
+    then reports the manifests repositories that changed, so a diff of a section
+    only one cluster is built from reads as that cluster's diff rather than as a
+    wall of unchanged clusters.
     """
 
     manifests_repository: str | None = None
     plugins_repository: str | None = None
     """Repository whose ``plugins`` directory parses non-system config."""
     outputs: Sequence[OutputSettings] = ()
-    diff_output: str | None = None
     idcat: IdcatSettings | None = None
     commenter: IssueCommenter | None = None
 
@@ -699,9 +700,8 @@ class DiffCommentProcessor:
         workdir = Path(tempfile.mkdtemp(prefix="relcoord-diff-"))
         try:
             source_checkout = workdir / "source"
-            output_settings = _selected_outputs(
-                _resolve_output_settings(self.outputs, self.manifests_repository),
-                self.diff_output,
+            output_settings = _resolve_output_settings(
+                self.outputs, self.manifests_repository
             )
             checkout_by_repository = _checkout_paths_by_repository(
                 workdir, output_settings
@@ -964,21 +964,6 @@ def _resolve_output_settings(
     )
 
 
-def _selected_outputs(
-    outputs: tuple[OutputSettings, ...], name: str | None
-) -> tuple[OutputSettings, ...]:
-    """Narrow the configured outputs to the one a diff was configured to report."""
-    if name is None:
-        return outputs
-    selected = tuple(output for output in outputs if output.name == name)
-    if not selected:
-        raise ChangeProcessingError(
-            f"diff-output '{name}' does not name a configured output"
-        )
-    logger.info("reporting the manifest diff for output %s only", name)
-    return selected
-
-
 def _deploy_config_and_namespace(
     source_checkout: Path, repo: str, commit: str, config_path: str, system: bool
 ) -> tuple[Path, str | None]:
@@ -1023,16 +1008,22 @@ def _changed_file_count(diff: ManifestDiff) -> int:
 
 
 def _diff_sections(diffs: Sequence[RepositoryDiff]) -> tuple[DiffSection, ...]:
-    """Pair each repository's diff with the heading to render it under.
+    """Pair each affected repository's diff with the heading to render it under.
 
-    A single manifests repository, which is the usual configuration, renders
-    without a heading.
+    A repository the commit generates no change for has nothing to show, so it
+    is left out rather than headed by a line saying so: what a reviewer wants is
+    the sections the change actually reaches. A comment left with a single
+    repository renders without a heading at all, which is what a deployment with
+    one manifests repository — the usual configuration — always gets.
     """
-    if len(diffs) == 1:
-        return (DiffSection(heading=None, diff=diffs[0].manifest_diff),)
+    changed = [entry for entry in diffs if entry.manifest_diff.diff.strip()]
+    if not changed:
+        return ()
+    if len(changed) == 1:
+        return (DiffSection(heading=None, diff=changed[0].manifest_diff),)
     return tuple(
         DiffSection(heading=entry.repository, diff=entry.manifest_diff)
-        for entry in diffs
+        for entry in changed
     )
 
 

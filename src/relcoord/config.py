@@ -256,7 +256,6 @@ class Settings:
     plugins_repository: str | None = None
     outputs: list[OutputSettings] = field(default_factory=list)
     rollouts: list[RolloutSettings] = field(default_factory=list)
-    diff_output: str | None = None
     detect_deployment: bool = False
     persistence: PersistenceSettings | None = None
     idcat: IdcatSettings | None = None
@@ -302,7 +301,11 @@ class Settings:
             raise ValueError(
                 "configure either manifests-repository or [[output]], not both"
             )
-        diff_output = _diff_output(data, outputs)
+        if "diff-output" in data:
+            raise ValueError(
+                "diff-output is not supported; a diff reports every output the "
+                "commit affects"
+            )
         detect_deployment = _bool_or_default(
             data, "detect-deployment", cls.detect_deployment
         )
@@ -331,7 +334,6 @@ class Settings:
             plugins_repository=_optional_string(data, "plugins-repository"),
             outputs=outputs,
             rollouts=rollouts,
-            diff_output=diff_output,
             detect_deployment=detect_deployment,
             persistence=(
                 PersistenceSettings.from_mapping(persistence) if persistence else None
@@ -383,26 +385,6 @@ def _optional_persistence_string(data: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"persistence.{key} must be a non-empty string")
     return value
-
-
-def _diff_output(data: dict[str, Any], outputs: list[OutputSettings]) -> str | None:
-    """Read the name of the output that /v1/diffcomment reports on.
-
-    A diff covering several clusters is not what a reviewer wants to read, so a
-    deployment with more than one output picks the one worth commenting on.
-    """
-    name = _optional_string(data, "diff-output")
-    if name is None:
-        return None
-    if not outputs:
-        raise ValueError("diff-output requires [[output]] entries")
-    configured = {output.name for output in outputs}
-    if name not in configured:
-        raise ValueError(
-            f"diff-output '{name}' does not name a configured output; "
-            f"expected one of {', '.join(sorted(configured))}"
-        )
-    return name
 
 
 def _outputs_from_entries(entries: list[Any]) -> list[OutputSettings]:

@@ -33,17 +33,19 @@ The token that posts the comment is an idcat-issued installation token for
 GitHub app configured under `[idcat]` needs permission to write pull request
 comments on the repositories that call this endpoint.
 
-A diff spanning every cluster a deployment generates for is more than a reviewer
-wants to read, so `diff-output` names the single output to report on:
+Every configured output is generated, because which of them a commit affects is
+not something the commit says: it is what generating shows. The comment then
+covers the manifests repositories that changed, and leaves the ones the commit
+generates nothing for out of it, so a change to a section only one cluster is
+built from reads as that cluster's diff rather than as a wall of unchanged
+clusters. A comment left with a single repository renders without a heading, and
+one covering several heads each repository's diff with its URL; a change no
+output is affected by comments that the generated output is unchanged.
 
-```toml
-diff-output = "example-dev"
-```
-
-Only that output is generated, and only its manifests repository is cloned; the
-other outputs are left alone. The name has to match one of the `[[output]]`
-entries, which relcoord checks at startup. Without `diff-output`, a diff covers
-every configured output, with a heading per manifests repository.
+`outputs` and `diffs` in the response still report every output that was
+generated and every repository that was diffed, unaffected ones included, which
+is where a reader who wants to see that a cluster was considered and left alone
+finds it.
 
 The `200` response body reports the diff and the comment:
 
