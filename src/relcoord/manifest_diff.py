@@ -52,6 +52,7 @@ CHECKSUM_ANNOTATION_PREFIX = "checksum/"
 # summary line instead of once per manifest.
 METADATA_SUMMARY_THRESHOLD = 2
 NO_CHANGES_MESSAGE = "The generated output is the same before and after this change"
+COMMENT_MARKER_PREFIX = "relcoord:manifest-diff"
 
 _DIFF_FILE_HEADER = re.compile(r"^diff --git a/(?P<old>.*) b/(?P<new>.*)$")
 _HUNK_HEADER = re.compile(r"^@@ -(?P<start>\d+)(?:,\d+)? \+\d+(?:,\d+)? @@$")
@@ -516,8 +517,16 @@ class _RenderedSection:
     empty: bool
 
 
+def comment_marker() -> str:
+    """The hidden line a comment carries so a later diff can find and edit it."""
+    return f"<!-- {COMMENT_MARKER_PREFIX} -->"
+
+
 def build_comment_body(
-    sections: Sequence[DiffSection], *, full_diff_reference: str
+    sections: Sequence[DiffSection],
+    *,
+    full_diff_reference: str,
+    marker: str | None = None,
 ) -> CommentBody:
     """Render the comment for one or more manifests repository diffs.
 
@@ -525,11 +534,12 @@ def build_comment_body(
     longer than GitHub accepts; ``omitted_context_diff`` reports whether the
     comment leaves the reader needing the full diff.
     """
+    preamble = [marker, ""] if marker is not None else []
     metadata = [f"manifest-builder version: `{MANIFEST_BUILDER_VERSION}`"]
     rendered = [_render_section(section, full_diff_reference) for section in sections]
     if all(section.empty for section in rendered):
         return CommentBody(
-            body="\n".join([NO_CHANGES_MESSAGE, "", *metadata]),
+            body="\n".join([*preamble, NO_CHANGES_MESSAGE, "", *metadata]),
             omitted_context_diff=False,
         )
 
@@ -539,7 +549,7 @@ def build_comment_body(
         for section in rendered
         for line in (*section.lines, *section.context_lines)
     ]
-    body_with_context = "\n".join([*with_context, "", *metadata])
+    body_with_context = "\n".join([*preamble, *with_context, "", *metadata])
     if len(body_with_context) <= MAX_COMMENT_CHARS:
         return CommentBody(
             body=body_with_context, omitted_context_diff=diff_was_filtered
@@ -555,7 +565,8 @@ def build_comment_body(
         if section.context_lines:
             without_context.extend(["", too_large])
     return CommentBody(
-        body="\n".join([*without_context, "", *metadata]), omitted_context_diff=True
+        body="\n".join([*preamble, *without_context, "", *metadata]),
+        omitted_context_diff=True,
     )
 
 

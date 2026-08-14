@@ -15,6 +15,7 @@ from relcoord.manifest_diff import (
     DiffSection,
     ManifestDiff,
     build_comment_body,
+    comment_marker,
     filter_metadata_hunks,
     manifest_diff,
     markdown_fence,
@@ -519,3 +520,13 @@ def test_markdown_fence_outgrows_the_backticks_it_has_to_hold() -> None:
     assert markdown_fence("plain") == "```"
     assert markdown_fence("a ``` fence") == "````"
     assert markdown_fence("a ````` fence") == "``````"
+
+
+def test_build_comment_body_carries_the_marker_as_a_hidden_first_line() -> None:
+    comment = build_comment_body(
+        [DiffSection(heading=None, diff=ManifestDiff(stat="", diff=""))],
+        full_diff_reference="unused",
+        marker=comment_marker(),
+    )
+
+    assert comment.body.startswith("<!-- relcoord:manifest-diff -->\n")

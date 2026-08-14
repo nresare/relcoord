@@ -32,6 +32,7 @@ from relcoord.manifest_diff import (
     DiffSection,
     ManifestDiff,
     build_comment_body,
+    comment_marker,
     manifest_diff,
 )
 
@@ -648,6 +649,7 @@ class DiffComment:
     body: str
     posted: bool
     url: str | None = None
+    updated: bool = False
 
 
 @dataclass(frozen=True)
@@ -866,11 +868,15 @@ class DiffCommentProcessor:
                         repository=repository,
                     )
 
+            marker = comment_marker()
             comment_body = build_comment_body(
                 _diff_sections(repository_diffs),
                 full_diff_reference=FULL_DIFF_REFERENCE,
+                marker=marker,
             )
-            comment = self._comment(repo, pull_request, comment_body.body, report)
+            comment = self._comment(
+                repo, pull_request, comment_body.body, marker, report
+            )
             return DiffResult(
                 repo=repo,
                 commit=commit,
@@ -892,6 +898,7 @@ class DiffCommentProcessor:
         repo: str,
         pull_request: int | None,
         body: str,
+        marker: str,
         report: Callable[..., None],
     ) -> DiffComment:
         if pull_request is None:
@@ -924,7 +931,7 @@ class DiffCommentProcessor:
             pull_request=pull_request,
         )
         try:
-            url = commenter.post_comment(repo, pull_request, body)
+            posted = commenter.post_comment(repo, pull_request, body, marker=marker)
         except GitCredentialError as exc:
             raise CredentialError(
                 "failed to obtain git credentials while posting a manifest diff "
@@ -933,8 +940,10 @@ class DiffCommentProcessor:
         except GithubCommentError as exc:
             raise CommentPostError(str(exc)) from exc
 
+        verb = "updated" if posted.updated else "posted"
         logger.info(
-            "diff complete: posted manifest diff comment to %s pull request #%s",
+            "diff complete: %s manifest diff comment on %s pull request #%s",
+            verb,
             repo,
             pull_request,
         )
@@ -943,9 +952,12 @@ class DiffCommentProcessor:
             f"commented on {short_repo(repo)} pull request #{pull_request}",
             repo=repo,
             pull_request=pull_request,
-            url=url,
+            url=posted.url,
+            updated=posted.updated,
         )
-        return DiffComment(body=body, posted=True, url=url)
+        return DiffComment(
+            body=body, posted=True, url=posted.url, updated=posted.updated
+        )
 
 
 def _resolve_output_settings(

@@ -730,6 +730,7 @@ def _comment_payload(comment: object) -> dict[str, Any] | None:
         return None
     return {
         "posted": getattr(comment, "posted", False),
+        "updated": getattr(comment, "updated", False),
         "url": getattr(comment, "url", None),
         "body": getattr(comment, "body", ""),
     }

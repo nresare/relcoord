@@ -19,7 +19,7 @@ from relcoord.change import (
 )
 from relcoord.config import OutputSettings
 from relcoord.git import GitCredentialError
-from relcoord.github import GithubCommentError
+from relcoord.github import GithubCommentError, PostedComment
 from relcoord.manifest_diff import ManifestDiff
 
 CONFIG_REPO = "https://github.com/acme/config.git"
@@ -38,20 +38,31 @@ class GenerationResult:
 class Commenter:
     """Records the comments a processor asks it to post."""
 
-    def __init__(self, url: str | None = "https://github.com/acme/config/pull/7#c1"):
+    def __init__(
+        self,
+        url: str | None = "https://github.com/acme/config/pull/7#c1",
+        updated: bool = False,
+    ):
         self.calls: list[tuple[str, int, str]] = []
+        self.markers: list[str | None] = []
         self._url = url
+        self._updated = updated
 
-    def post_comment(self, repo: str, pull_request: int, body: str) -> str | None:
+    def post_comment(
+        self, repo: str, pull_request: int, body: str, *, marker: str | None = None
+    ) -> PostedComment:
         self.calls.append((repo, pull_request, body))
-        return self._url
+        self.markers.append(marker)
+        return PostedComment(url=self._url, updated=self._updated)
 
 
 class FailingCommenter:
     def __init__(self, error: Exception) -> None:
         self._error = error
 
-    def post_comment(self, repo: str, pull_request: int, body: str) -> str | None:
+    def post_comment(
+        self, repo: str, pull_request: int, body: str, *, marker: str | None = None
+    ) -> PostedComment:
         raise self._error
 
 
@@ -404,6 +415,7 @@ def test_diff_reports_no_changes_when_no_output_is_affected(
     )
 
     assert result.comment.body.startswith(
+        "<!-- relcoord:manifest-diff -->\n\n"
         "The generated output is the same before and after this change"
     )
 
@@ -600,3 +612,24 @@ def test_manifests_diff_is_empty_when_manifest_builder_made_no_commit(
     result = change._manifests_diff(checkout, base_commit)
 
     assert result == ManifestDiff(stat="", diff="", summary="", filtered_diff=None)
+
+
+def test_diff_marks_its_comment_so_a_later_diff_can_update_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(
+        monkeypatch, tmp_path, diff=ManifestDiff(stat="api.yaml | 1 +\n", diff="+api")
+    )
+    commenter = Commenter(updated=True)
+    outputs = [
+        OutputSettings(name="dev", repository=MANIFESTS_REPO, directory=Path("dev"))
+    ]
+
+    result = DiffCommentProcessor(outputs=outputs, commenter=commenter).diff(
+        CONFIG_REPO, "deadbeef", pull_request=7
+    )
+
+    marker = "<!-- relcoord:manifest-diff -->"
+    assert commenter.markers == [marker]
+    assert marker in commenter.calls[0][2]
+    assert result.comment.updated

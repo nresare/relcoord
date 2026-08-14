@@ -28,6 +28,13 @@ request of `config_repo`, which then has to be an `https://github.com` URL;
 without it, the response carries the comment body it would have posted and
 nothing is sent to GitHub.
 
+A pull request that gets several commits should not collect a diff comment per
+push, so the comment body carries a hidden `<!-- relcoord:manifest-diff -->` line
+and relcoord edits the comment carrying that line instead of adding another.
+`updated` in the response says which happened;
+comments from anyone else, and relcoord comments posted before this marker existed,
+are left alone.
+
 The token that posts the comment is an idcat-issued installation token for
 `config_repo`, taken from the same per-repository cache the clones use, so the
 GitHub app configured under `[idcat]` needs permission to write pull request
@@ -64,7 +71,8 @@ The `200` response body reports the diff and the comment:
     {"repository": "https://github.com/example/manifests",
      "stat": " example-dev/api.yaml | 2 +-\n", "summary": "", "diff": "diff --git ..."}
   ],
-  "comment": {"posted": true, "url": "https://github.com/...", "body": "..."}
+  "comment": {"posted": true, "updated": false,
+              "url": "https://github.com/...", "body": "..."}
 }
 ```
 

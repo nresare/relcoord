@@ -1623,6 +1623,7 @@ def test_diffcomment_returns_the_diff_and_the_posted_comment() -> None:
     ]
     assert body["comment"] == {
         "posted": True,
+        "updated": False,
         "url": "https://github.com/acme/config/pull/7#issuecomment-1",
         "body": "the comment body",
     }
