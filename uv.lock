@@ -593,7 +593,7 @@ wheels = [
 
 [[package]]
 name = "manifest-builder"
-version = "0.7.7"
+version = "0.7.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -602,7 +602,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/14/02/1ed414c905691edd3bd6f51c814e3940952d299c27e1c6bf5fef598ec78d/manifest_builder-0.7.7-py3-none-any.whl", hash = "sha256:633e462fe50e7f0adf48edf5a03da4f673989c1d635717445f00a296e410b12c", size = 46924, upload-time = "2026-08-14T10:33:05.157Z" },
+    { url = "https://files.pythonhosted.org/packages/14/18/77512ba99b5ac0fc47b8bf94e99718666ad340dfe66687bb2ace3277add5/manifest_builder-0.7.8-py3-none-any.whl", hash = "sha256:faa241bbff1fc047a0d7037ba2fdf4038d52fdb6cfa7c08056e6b850c8262a8c", size = 47123, upload-time = "2026-08-14T15:47:42.218Z" },
 ]
 
 [[package]]
@@ -920,7 +920,7 @@ requires-dist = [
     { name = "dulwich" },
     { name = "httpx" },
     { name = "hypercorn" },
-    { name = "manifest-builder", specifier = ">=0.7.7", index = "https://pypi.org/simple" },
+    { name = "manifest-builder", specifier = ">=0.7.8", index = "https://pypi.org/simple" },
     { name = "pyjwt", extras = ["crypto"] },
     { name = "pyyaml" },
     { name = "starlette" },
