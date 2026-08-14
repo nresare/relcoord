@@ -257,6 +257,21 @@ to be gone. Objects are waited for with a list narrowed to the object's name
 followed by a watch, so a rollout is observed as it happens rather than polled
 for.
 
+Carrying the deploy-id says the write landed, not that it took effect, so for the
+kinds that roll a write out to pods the wait goes further. A Deployment has to
+have had its new generation observed, its new ReplicaSet scaled up, the old ones
+drained and the new pods become available; a StatefulSet has to have had its new
+generation observed, every replica become ready and the replicas its update
+strategy covers updated to the new revision. These are the checks `kubectl
+rollout status` makes, and like it relcoord treats a partitioned StatefulSet
+rollout as complete once the ordinals above the partition are updated, since the
+ordinals below it are held back on purpose. A StatefulSet updated `OnDelete` has
+nothing rolling the change out — its pods are replaced whenever someone deletes
+them — so there the write landing is as far as detection waits. A Deployment the
+cluster has given up on, one that is paused or one whose rollout exceeded its
+progress deadline, fails the wait immediately rather than waiting out the
+timeout.
+
 The connection properties live on the output whose deployment they describe.
 With deployment detection enabled, every output must explicitly set
 `connection-type` to either `eks` or `local`:

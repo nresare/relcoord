@@ -54,7 +54,13 @@ DISCOVERY = {
                 "kind": "Deployment",
                 "namespaced": True,
                 "verbs": ["get", "list", "watch"],
-            }
+            },
+            {
+                "name": "statefulsets",
+                "kind": "StatefulSet",
+                "namespaced": True,
+                "verbs": ["get", "list", "watch"],
+            },
         ]
     },
 }
@@ -107,6 +113,48 @@ def deployment(
                 replicas if available_replicas is None else available_replicas
             ),
             "conditions": conditions or [],
+        },
+    }
+
+
+def statefulset(
+    name: str,
+    deploy_id: str | None,
+    *,
+    generation: int = 1,
+    observed_generation: int | None = None,
+    replicas: int = 2,
+    ready_replicas: int | None = None,
+    updated_replicas: int | None = None,
+    update_strategy: str = "RollingUpdate",
+    partition: int | None = None,
+    current_revision: str = "db-7f4",
+    update_revision: str | None = None,
+) -> dict[str, Any]:
+    """A StatefulSet that has finished rolling out, unless told otherwise."""
+    annotations = {} if deploy_id is None else {DEPLOY_ID_ANNOTATION: deploy_id}
+    strategy: dict[str, Any] = {"type": update_strategy}
+    if partition is not None:
+        strategy["rollingUpdate"] = {"partition": partition}
+    return {
+        "metadata": {
+            "name": name,
+            "annotations": annotations,
+            "generation": generation,
+        },
+        "spec": {"replicas": replicas, "updateStrategy": strategy},
+        "status": {
+            "observedGeneration": (
+                generation if observed_generation is None else observed_generation
+            ),
+            "readyReplicas": replicas if ready_replicas is None else ready_replicas,
+            "updatedReplicas": (
+                replicas if updated_replicas is None else updated_replicas
+            ),
+            "currentRevision": current_revision,
+            "updateRevision": (
+                current_revision if update_revision is None else update_revision
+            ),
         },
     }
 
@@ -210,14 +258,15 @@ def test_detector_watches_until_the_deploy_id_annotation_appears(
     assert "has materialised in cluster example-dev" in caplog.text
 
 
-def deployments_handler(listed: dict[str, Any], *watched: dict[str, Any]):
+def apps_handler(resource: str, listed: dict[str, Any], *watched: dict[str, Any]):
     """Serve discovery, one listing of ``listed``, then a watch of ``watched``."""
+    collection = f"/apis/apps/v1/namespaces/default/{resource}"
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path in DISCOVERY:
             return httpx.Response(200, json=DISCOVERY[path])
-        if path != "/apis/apps/v1/namespaces/default/deployments":
+        if path != collection:
             return httpx.Response(500, json={"unexpected": path})
         if "watch" not in request.url.params:
             return httpx.Response(200, json=listing(listed))
@@ -229,10 +278,26 @@ def deployments_handler(listed: dict[str, Any], *watched: dict[str, Any]):
     return handler
 
 
+def deployments_handler(listed: dict[str, Any], *watched: dict[str, Any]):
+    return apps_handler("deployments", listed, *watched)
+
+
+def statefulsets_handler(listed: dict[str, Any], *watched: dict[str, Any]):
+    return apps_handler("statefulsets", listed, *watched)
+
+
 def wait_for_deployment(handler, *, timeout_seconds: float = 5) -> None:
     detector(handler, timeout_seconds=timeout_seconds).wait_for_success(
         deploy_id=DEPLOY_ID,
         created_or_modified={Ref("Deployment", "default", "api", "apps/v1")},
+        removed=set(),
+    )
+
+
+def wait_for_statefulset(handler, *, timeout_seconds: float = 5) -> None:
+    detector(handler, timeout_seconds=timeout_seconds).wait_for_success(
+        deploy_id=DEPLOY_ID,
+        created_or_modified={Ref("StatefulSet", "default", "db", "apps/v1")},
         removed=set(),
     )
 
@@ -376,6 +441,177 @@ def test_detector_reports_why_a_replica_set_cannot_create_pods() -> None:
     # Transient on its own, so it explains the wait rather than ending it.
     assert "exceeded quota" in message
     assert "timed out after" in message
+
+
+def test_detector_waits_for_a_statefulset_to_replace_its_pods(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    handler = statefulsets_handler(
+        # The first pod has been taken down for its replacement.
+        statefulset(
+            "db",
+            DEPLOY_ID,
+            ready_replicas=1,
+            updated_replicas=0,
+            update_revision="db-9c1",
+        ),
+        # Back up at the new revision, and the second pod not yet updated.
+        statefulset("db", DEPLOY_ID, updated_replicas=1, update_revision="db-9c1"),
+        # Both updated, and the controller has yet to make the revision current.
+        statefulset("db", DEPLOY_ID, update_revision="db-9c1"),
+        statefulset("db", DEPLOY_ID, current_revision="db-9c1"),
+    )
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        wait_for_statefulset(handler)
+
+    assert "1 of 2 replicas are ready" in caplog.text
+    assert "has materialised in cluster example-dev" in caplog.text
+
+
+def test_detector_waits_for_a_statefulset_change_that_rolls_no_pods(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A change that leaves the pod template alone: every replica is already
+    # updated and ready, so the wait is only for the controller to catch up.
+    handler = statefulsets_handler(
+        statefulset("db", DEPLOY_ID, generation=4, observed_generation=3),
+        statefulset("db", DEPLOY_ID, generation=4),
+    )
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        wait_for_statefulset(handler)
+
+    assert "statefulset controller has observed generation 3, not 4" in caplog.text
+    assert "has materialised in cluster example-dev" in caplog.text
+
+
+def test_detector_logs_what_it_observed_of_a_statefulset_rollout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    handler = statefulsets_handler(
+        statefulset("db", DEPLOY_ID, generation=7, replicas=3)
+    )
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        wait_for_statefulset(handler)
+
+    assert (
+        "reaching deploy-id 0123456789abcdef with a complete rollout after 0.0s: "
+        "generation 7 observed, 3 of 3 replicas updated and ready"
+    ) in caplog.text
+
+
+def test_detector_times_out_reporting_where_a_statefulset_rollout_got_to() -> None:
+    handler = statefulsets_handler(
+        statefulset(
+            "db", DEPLOY_ID, replicas=3, updated_replicas=1, update_revision="db-9c1"
+        )
+    )
+
+    with pytest.raises(DeploymentDetectionError) as excinfo:
+        wait_for_statefulset(handler, timeout_seconds=0)
+
+    message = str(excinfo.value)
+    assert "StatefulSet/default/db" in message
+    assert "complete rollout" in message
+    assert "1 of 3 replicas have been updated" in message
+
+
+def test_detector_waits_only_for_the_replicas_a_partition_covers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # partition = 2 of 3 replicas holds ordinals 0 and 1 back, so the rollout is
+    # over once the one ordinal above the partition carries the new revision.
+    handler = statefulsets_handler(
+        statefulset(
+            "db",
+            DEPLOY_ID,
+            replicas=3,
+            updated_replicas=0,
+            partition=2,
+            update_revision="db-9c1",
+        ),
+        statefulset(
+            "db",
+            DEPLOY_ID,
+            replicas=3,
+            updated_replicas=1,
+            partition=2,
+            update_revision="db-9c1",
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        wait_for_statefulset(handler)
+
+    assert "0 of 1 replicas above partition 2 have been updated" in caplog.text
+    assert (
+        "generation 1 observed, 1 of 1 replicas above partition 2 updated and "
+        "3 of 3 ready"
+    ) in caplog.text
+
+
+def test_detector_waits_for_a_statefulset_a_partition_holds_entirely_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A partition at or above the replica count updates no pod at all, so the
+    # readiness of the pods already there is the whole of the rollout.
+    handler = statefulsets_handler(
+        statefulset(
+            "db",
+            DEPLOY_ID,
+            replicas=2,
+            updated_replicas=0,
+            partition=2,
+            update_revision="db-9c1",
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        wait_for_statefulset(handler)
+
+    assert "0 of 0 replicas above partition 2 updated" in caplog.text
+
+
+def test_detector_does_not_wait_for_pods_an_on_delete_statefulset_keeps(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Nothing replaces the pods of an OnDelete StatefulSet until someone deletes
+    # them, so the write landing is as far as detection can wait.
+    handler = statefulsets_handler(
+        statefulset(
+            "db",
+            DEPLOY_ID,
+            update_strategy="OnDelete",
+            updated_replicas=0,
+            update_revision="db-9c1",
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="relcoord.kubernetes"):
+        wait_for_statefulset(handler)
+
+    assert "it is updated OnDelete" in caplog.text
+    assert "has materialised in cluster example-dev" in caplog.text
+
+
+def test_detector_waits_for_an_on_delete_statefulset_to_be_observed() -> None:
+    # The write still has to be one the controller has acted on.
+    handler = statefulsets_handler(
+        statefulset(
+            "db",
+            DEPLOY_ID,
+            update_strategy="OnDelete",
+            generation=4,
+            observed_generation=3,
+        )
+    )
+
+    with pytest.raises(DeploymentDetectionError) as excinfo:
+        wait_for_statefulset(handler, timeout_seconds=0)
+
+    assert "has observed generation 3, not 4" in str(excinfo.value)
 
 
 def test_detector_watches_until_a_removed_object_is_deleted() -> None:

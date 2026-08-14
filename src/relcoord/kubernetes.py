@@ -8,8 +8,9 @@ are deployed to and waits, using watches rather than polling, until every
 changed object carries that deploy-id and every removed object is gone.
 
 Carrying the deploy-id only says that the write landed, not that it took effect.
-For Deployments the wait goes further and holds until the rollout the write asked
-for has finished; see ``_rollout_progress``.
+For the workload kinds that roll a write out — Deployments and StatefulSets — the
+wait goes further and holds until that rollout has finished; see
+``_deployment_rollout_progress`` and ``_statefulset_rollout_progress``.
 """
 
 from __future__ import annotations
@@ -42,9 +43,10 @@ WATCH_TIMEOUT_SECONDS = 300.0
 # straight away, so a cluster refusing watches does not spin.
 WATCH_RETRY_SECONDS = 1.0
 CONNECT_TIMEOUT_SECONDS = 10.0
-# The apps/v1 deployments resource, the only kind with a rollout to wait for.
-DEPLOYMENTS_PATH_PREFIX = "/apis/apps/v1"
+# The apps/v1 group, which serves the kinds that have a rollout to wait for.
+APPS_PATH_PREFIX = "/apis/apps/v1"
 DEPLOYMENTS_RESOURCE_NAME = "deployments"
+STATEFULSETS_RESOURCE_NAME = "statefulsets"
 
 
 class KubernetesObjectRef(Protocol):
@@ -562,16 +564,16 @@ def _goal_for(resource: KubernetesResource, deploy_id: str) -> Goal:
     """Return what an object of this resource has to reach to count as deployed.
 
     Every object has to carry the deploy-id, which is what says the write landed.
-    A Deployment has to have finished rolling that write out on top of it.
+    A Deployment or a StatefulSet has to have finished rolling that write out on
+    top of it.
     """
-    if (
-        resource.path_prefix == DEPLOYMENTS_PATH_PREFIX
-        and resource.name == DEPLOYMENTS_RESOURCE_NAME
-    ):
-        return Goal(
-            description=f"deploy-id {deploy_id} with a complete rollout",
-            progress=lambda obj: _deployment_progress(obj, deploy_id),
-        )
+    if resource.path_prefix == APPS_PATH_PREFIX:
+        rollout = _ROLLOUT_PROGRESS.get(resource.name)
+        if rollout is not None:
+            return Goal(
+                description=f"deploy-id {deploy_id} with a complete rollout",
+                progress=lambda obj: _rollout_goal_progress(obj, deploy_id, rollout),
+            )
     return Goal(
         description=f"deploy-id {deploy_id}",
         progress=lambda obj: _deploy_id_progress(obj, deploy_id),
@@ -587,15 +589,24 @@ def _deploy_id_progress(obj: dict[str, Any] | None, deploy_id: str) -> Progress:
     return _complete()
 
 
-def _deployment_progress(obj: dict[str, Any] | None, deploy_id: str) -> Progress:
-    """Return how far a Deployment is towards having rolled the change out."""
+def _rollout_goal_progress(
+    obj: dict[str, Any] | None,
+    deploy_id: str,
+    rollout: Callable[[dict[str, Any]], Progress],
+) -> Progress:
+    """Return how far an object is towards having rolled the change out.
+
+    The write has to have landed before its rollout means anything, so the
+    deploy-id is checked first and the rollout only once it is the one the change
+    asked for.
+    """
     landed = _deploy_id_progress(obj, deploy_id)
     if landed.state is not ProgressState.COMPLETE or obj is None:
         return landed
-    return _rollout_progress(obj)
+    return rollout(obj)
 
 
-def _rollout_progress(obj: dict[str, Any]) -> Progress:
+def _deployment_rollout_progress(obj: dict[str, Any]) -> Progress:
     """Return how far an observed Deployment is through its rollout.
 
     These are the checks ``kubectl rollout status`` makes, in its order, and they
@@ -658,6 +669,90 @@ def _rollout_progress(obj: dict[str, Any]) -> Progress:
             "updated and available"
         )
     return _pending(_with_replica_failure(status, detail))
+
+
+def _statefulset_rollout_progress(obj: dict[str, Any]) -> Progress:
+    """Return how far an observed StatefulSet is through its rollout.
+
+    These are the checks ``kubectl rollout status`` makes of a StatefulSet, in its
+    order: the controller observes the new generation, every replica becomes
+    ready, and the replicas the update strategy covers are updated to the new
+    revision. Unlike a Deployment a StatefulSet replaces its pods in place rather
+    than through a second ReplicaSet, so there is nothing to drain and
+    ``status.readyReplicas`` counts the same pods throughout.
+
+    ``rollingUpdate.partition`` holds the ordinals below it back on purpose, so
+    the rollout is complete once the ordinals at or above it have been updated —
+    a partitioned rollout is a canary that is finished when its canary is, not one
+    that never finishes. A StatefulSet updated ``OnDelete`` has nothing rolling
+    the change out at all: its pods are replaced when someone deletes them, which
+    may be long after the change, so the write landing is as far as this can wait.
+    """
+    spec = _child(obj, "spec")
+    status = _child(obj, "status")
+    strategy = _child(spec, "updateStrategy")
+
+    generation = _count(_child(obj, "metadata").get("generation"))
+    observed_generation = _count(status.get("observedGeneration"))
+    if observed_generation < generation:
+        return _pending(
+            f"the statefulset controller has observed generation "
+            f"{observed_generation}, not {generation}"
+        )
+
+    if strategy.get("type") == "OnDelete":
+        return _complete(
+            f"generation {generation} observed; it is updated OnDelete, so no "
+            "controller rolls the change out to its pods"
+        )
+
+    # Absent from the JSON means zero: the replica counts are all omitempty.
+    desired = _count(spec.get("replicas"), default=1)
+    ready = _count(status.get("readyReplicas"))
+    updated = _count(status.get("updatedReplicas"))
+    if ready < desired:
+        return _pending(f"{ready} of {desired} replicas are ready")
+
+    partition = _count(_child(strategy, "rollingUpdate").get("partition"))
+    if partition > 0:
+        # A partition above the replica count holds every pod back, which leaves
+        # nothing for the rollout to do rather than a negative amount of it.
+        covered = max(desired - partition, 0)
+        if updated < covered:
+            return _pending(
+                f"{updated} of {covered} replicas above partition {partition} "
+                "have been updated"
+            )
+        return _complete(
+            f"generation {generation} observed, {updated} of {covered} replicas "
+            f"above partition {partition} updated and {ready} of {desired} ready"
+        )
+
+    if updated < desired:
+        return _pending(f"{updated} of {desired} replicas have been updated")
+    current_revision = status.get("currentRevision")
+    update_revision = status.get("updateRevision")
+    if (
+        isinstance(current_revision, str)
+        and isinstance(update_revision, str)
+        and current_revision != update_revision
+    ):
+        return _pending(
+            f"its pods are at revision {update_revision}, which the controller "
+            f"has not yet made current in place of {current_revision}"
+        )
+    return _complete(
+        f"generation {generation} observed, {updated} of {desired} replicas "
+        "updated and ready"
+    )
+
+
+# The apps/v1 resources whose rollout of a write is waited for, and how each one
+# reports how far through that rollout it is.
+_ROLLOUT_PROGRESS: dict[str, Callable[[dict[str, Any]], Progress]] = {
+    DEPLOYMENTS_RESOURCE_NAME: _deployment_rollout_progress,
+    STATEFULSETS_RESOURCE_NAME: _statefulset_rollout_progress,
+}
 
 
 def _with_replica_failure(status: dict[str, Any], detail: str) -> str:
