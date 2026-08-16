@@ -173,32 +173,32 @@ def test_settings_parses_manifests_repository(tmp_path: Path) -> None:
     assert settings.manifests_repository == "https://github.com/acme/manifests.git"
 
 
-def test_settings_parses_plugins_repository(tmp_path: Path) -> None:
+def test_settings_parses_system_repository(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text(
         """
-        plugins-repository = "https://github.com/acme/plugins.git"
+        system-repository = "https://github.com/acme/system.git"
         """
     )
 
     settings = Settings.from_toml(config)
 
-    assert settings.plugins_repository == "https://github.com/acme/plugins.git"
+    assert settings.system_repository == "https://github.com/acme/system.git"
 
 
-def test_settings_defaults_plugins_repository_to_none(tmp_path: Path) -> None:
+def test_settings_defaults_system_repository_to_none(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
     config.write_text("")
 
-    assert Settings.from_toml(config).plugins_repository is None
+    assert Settings.from_toml(config).system_repository is None
 
 
-def test_settings_rejects_empty_plugins_repository(tmp_path: Path) -> None:
+def test_settings_rejects_empty_system_repository(tmp_path: Path) -> None:
     config = tmp_path / "relcoord.toml"
-    config.write_text('plugins-repository = ""\n')
+    config.write_text('system-repository = ""\n')
 
     with pytest.raises(
-        ValueError, match="plugins-repository must be a non-empty string"
+        ValueError, match="system-repository must be a non-empty string"
     ):
         Settings.from_toml(config)
 

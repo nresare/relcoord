@@ -5,16 +5,15 @@ port = 8080
 log-level = "INFO"
 detect-deployment = false
 
-# Repository holding the manifest-builder plugins that parse config from source
-# repositories which do not carry their own. Its "plugins" subdirectory is
-# passed to manifest-builder alongside the config directory's own plugins, and
-# the latest commit on the default branch is what gets used: the commit hash is
-# recorded on the generated manifests commit as "<repository>@<commit>".
+# Shared system repository. For non-system requests, its "plugins" subdirectory
+# is passed to manifest-builder alongside the config directory's own plugins.
+# The latest commit on main is used, and its hash is recorded on the generated
+# manifests commit as "<repository>@<commit>".
 #
 # System-mode requests are not affected. Their config comes from a repository
 # that already carries the plugins it needs, so this repository is left out of
 # those.
-plugins-repository = "https://github.com/example/manifest-builder-plugins"
+system-repository = "https://github.com/example/system"
 
 [[output]]
 name = "example-dev"

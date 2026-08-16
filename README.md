@@ -83,7 +83,7 @@ shows. `diffs[].diff` is always the unabridged diff, which is where the comment
 points a reader who needs the part it left out.
 
 `Accept: text/event-stream` works here too, with the same event shapes as
-`/v1/change` and phases `source-checkout`, `deploy-config`, `plugins-checkout`,
+`/v1/change` and phases `source-checkout`, `deploy-config`, `system-checkout`,
 `manifests-checkout`, `generate`, `generated`, `diff`, `no-changes`, `comment`,
 `commented` and `no-comment`.
 
@@ -106,7 +106,7 @@ The stream carries four kinds of event:
   `registered` image version, so the client can render something before any git
   work starts.
 - `progress` — one per step, with a stable `phase` (`source-checkout`,
-  `deploy-config`, `plugins-checkout`, `rollout-stage`, `manifests-checkout`,
+  `deploy-config`, `system-checkout`, `rollout-stage`, `manifests-checkout`,
   `generate`, `generated`, `changed-objects`, `no-changes`, `push`, `pushed`,
   `deployment-detection`, `rollout-stage-verified`),
   a human readable `message`, and a `detail` object with specifics of the step.
@@ -210,6 +210,18 @@ region-name = "eu-west-2"
 The DynamoDB table must already exist with string partition key `pk` and string
 sort key `sk`. AWS credentials are resolved using the standard boto3 provider
 chain. For local development against DynamoDB Local, set `endpoint-url`.
+
+Non-system config repositories can share manifest-builder plugins from a
+separate system repository:
+
+```toml
+system-repository = "https://github.com/example/system"
+```
+
+Relcoord shallow-clones its latest `main` commit for each non-system change or
+diff and loads the `plugins` directory. The repository and resolved commit are
+recorded in the generated manifest commit. System changes do not clone it;
+their plugins continue to come from the `config_repo` checkout itself.
 
 Manifest generation outputs are configured with `[[output]]` entries. Each
 output names a manifests repository, an optional directory inside that

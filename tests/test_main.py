@@ -16,6 +16,7 @@ from relcoord.main import (
     HTTP_CLIENT_LOGGERS,
     configure_logging,
     make_change_processor,
+    make_diff_processor,
     make_store,
 )
 from relcoord.retrying_store import RetryingImageInfoStore
@@ -40,6 +41,19 @@ def test_make_change_processor_uses_manifests_repository() -> None:
     assert isinstance(processor, ChangeProcessor)
     assert processor.manifests_repository == "https://github.com/acme/manifests.git"
     assert processor.detect_deployment is True
+
+
+def test_processors_use_system_repository() -> None:
+    settings = Settings(
+        manifests_repository="https://github.com/acme/manifests.git",
+        system_repository="https://github.com/acme/system.git",
+    )
+
+    change_processor = make_change_processor(settings)
+    diff_processor = make_diff_processor(settings)
+
+    assert change_processor.system_repository == "https://github.com/acme/system.git"
+    assert diff_processor.system_repository == "https://github.com/acme/system.git"
 
 
 def test_make_change_processor_uses_outputs() -> None:

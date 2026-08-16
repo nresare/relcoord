@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # with the response that asked for the comment.
 FULL_DIFF_REFERENCE = "returned in the relcoord response for this request"
 
-# Subdirectory of the configured plugins repository holding the plugin modules,
+# Subdirectory of the configured system repository holding the plugin modules,
 # matching the layout manifest-builder expects of a config directory.
 PLUGINS_DIRECTORY = "plugins"
 
@@ -63,8 +63,8 @@ class DeployConfigError(ChangeProcessingError):
     pass
 
 
-class PluginsRepositoryError(ChangeProcessingError):
-    """Raised when the configured plugins repository has no plugins directory.
+class SystemRepositoryError(ChangeProcessingError):
+    """Raised when the configured system repository has no plugins directory.
 
     That is a relcoord configuration mistake rather than anything the change
     request did, so it is worth naming the repository the operator configured;
@@ -205,8 +205,8 @@ class ChangeStage:
 @dataclass(frozen=True)
 class ChangeProcessor:
     manifests_repository: str | None = None
-    plugins_repository: str | None = None
-    """Repository whose ``plugins`` directory parses non-system config."""
+    system_repository: str | None = None
+    """Shared repository whose ``plugins`` directory parses non-system config."""
     outputs: Sequence[OutputSettings] = ()
     rollouts: Sequence[RolloutSettings] = ()
     """Pipelines the outputs are deployed in, one stage at a time."""
@@ -276,8 +276,8 @@ class ChangeProcessor:
                 namespace=namespace,
                 targets=declares_targets,
             )
-            plugins = _external_plugins(
-                self.plugins_repository,
+            plugins = _system_plugins(
+                self.system_repository,
                 workdir,
                 system,
                 self.idcat,
@@ -680,8 +680,8 @@ class DiffCommentProcessor:
     """
 
     manifests_repository: str | None = None
-    plugins_repository: str | None = None
-    """Repository whose ``plugins`` directory parses non-system config."""
+    system_repository: str | None = None
+    """Shared repository whose ``plugins`` directory parses non-system config."""
     outputs: Sequence[OutputSettings] = ()
     idcat: IdcatSettings | None = None
     commenter: IssueCommenter | None = None
@@ -744,8 +744,8 @@ class DiffCommentProcessor:
                 namespace=namespace,
                 targets=declares_targets,
             )
-            plugins = _external_plugins(
-                self.plugins_repository,
+            plugins = _system_plugins(
+                self.system_repository,
                 workdir,
                 system,
                 self.idcat,
@@ -1491,8 +1491,8 @@ def _checkout_commit(
     _dulwich_checkout(target, commit)
 
 
-def _external_plugins(
-    plugins_repository: str | None,
+def _system_plugins(
+    system_repository: str | None,
     workdir: Path,
     system: bool,
     idcat: IdcatSettings | None,
@@ -1500,33 +1500,33 @@ def _external_plugins(
     *,
     step: str,
 ) -> ExternalPlugins | None:
-    """Check out the configured plugins repository, for a non-system request.
+    """Check out plugins from the system repository for a non-system request.
 
     System-mode config comes from a repository that carries its own plugins, so
     the configured repository is only consulted for the ordinary case where it
     does not.
     """
-    if plugins_repository is None or system:
+    if system_repository is None or system:
         return None
-    plugins = _checkout_plugins(plugins_repository, workdir / "plugins", idcat)
+    plugins = _checkout_system_plugins(system_repository, workdir / "system", idcat)
     logger.info("%s: checked out plugins from %s", step, plugins.source)
     _, _, plugins_commit = plugins.source.rpartition("@")
     report(
-        "plugins-checkout",
-        f"using plugins from {short_repo(plugins_repository)} "
+        "system-checkout",
+        f"using plugins from {short_repo(system_repository)} "
         f"at {short_commit(plugins_commit)}",
-        repository=plugins_repository,
+        repository=system_repository,
         source=plugins.source,
     )
     return plugins
 
 
-def _checkout_plugins(
+def _checkout_system_plugins(
     repository: str, target: Path, idcat: IdcatSettings | None
 ) -> ExternalPlugins:
-    """Check out the plugins repository and describe it for manifest-builder.
+    """Check out the system repository and describe its manifest-builder plugins.
 
-    The latest commit on the default branch is what gets used, and its hash goes
+    The latest commit on the main branch is what gets used, and its hash goes
     into ``source`` so the ``Plugins from:`` line of a generated commit records
     exactly which plugins produced those manifests.
     """
@@ -1534,14 +1534,15 @@ def _checkout_plugins(
         repository,
         target,
         idcat,
-        purpose=f"cloning plugins repo {repository}",
+        purpose=f"cloning system repo {repository}",
         depth="1",
+        branch="main",
     )
     commit = _head_commit(target)
     path = target / PLUGINS_DIRECTORY
     if not path.is_dir():
-        raise PluginsRepositoryError(
-            f"plugins repo {repository} at commit {commit} has no "
+        raise SystemRepositoryError(
+            f"system repo {repository} at commit {commit} has no "
             f"{PLUGINS_DIRECTORY}/ directory"
         )
     return ExternalPlugins(path=path, source=f"{repository}@{commit}")
@@ -1571,6 +1572,7 @@ def _clone_repository(
     purpose: str,
     depth: str | None = None,
     no_checkout: bool = False,
+    branch: str | None = None,
 ) -> None:
     credentials = _credentials_for(source, idcat, purpose)
     clone_output = BytesIO()
@@ -1582,6 +1584,7 @@ def _clone_repository(
                 target,
                 checkout=not no_checkout,
                 depth=int(depth) if depth is not None else None,
+                branch=branch,
                 errstream=clone_output,
             )
         else:
@@ -1590,6 +1593,7 @@ def _clone_repository(
                 target,
                 checkout=not no_checkout,
                 depth=int(depth) if depth is not None else None,
+                branch=branch,
                 errstream=clone_output,
                 username=credentials.username,
                 password=credentials.password or "",

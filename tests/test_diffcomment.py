@@ -24,7 +24,7 @@ from relcoord.manifest_diff import ManifestDiff
 
 CONFIG_REPO = "https://github.com/acme/config.git"
 MANIFESTS_REPO = "https://github.com/acme/manifests.git"
-PLUGINS_REPO = "https://github.com/acme/plugins.git"
+SYSTEM_REPO = "https://github.com/acme/shared-system.git"
 
 
 @dataclass(frozen=True)
@@ -99,7 +99,7 @@ def _fake_git(
     def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
         recorded.append(("clone", repo, target.name, kwargs))
         target.mkdir(parents=True)
-        if repo == PLUGINS_REPO:
+        if repo == SYSTEM_REPO:
             (target / "plugins").mkdir()
 
     def fake_generate(
@@ -465,7 +465,7 @@ def test_diff_system_mode_uses_the_repository_root(
     assert generate_call[5] is None
 
 
-def test_diff_checks_out_the_plugins_repository_and_passes_it_to_generate(
+def test_diff_checks_out_the_system_repository_and_passes_plugins_to_generate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -473,17 +473,17 @@ def test_diff_checks_out_the_plugins_repository_and_passes_it_to_generate(
 
     DiffCommentProcessor(
         manifests_repository=MANIFESTS_REPO,
-        plugins_repository=PLUGINS_REPO,
+        system_repository=SYSTEM_REPO,
         commenter=Commenter(),
     ).diff(CONFIG_REPO, "deadbeef")
 
     assert captured["plugins"] == ExternalPlugins(
-        path=tmp_path / "plugins" / "plugins",
-        source=f"{PLUGINS_REPO}@feedface",
+        path=tmp_path / "system" / "plugins",
+        source=f"{SYSTEM_REPO}@feedface",
     )
 
 
-def test_diff_leaves_the_plugins_repository_out_of_system_mode(
+def test_diff_leaves_the_system_repository_out_of_system_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -492,13 +492,13 @@ def test_diff_leaves_the_plugins_repository_out_of_system_mode(
 
     DiffCommentProcessor(
         manifests_repository=MANIFESTS_REPO,
-        plugins_repository=PLUGINS_REPO,
+        system_repository=SYSTEM_REPO,
         commenter=Commenter(),
     ).diff(CONFIG_REPO, "deadbeef", system=True)
 
     assert captured["plugins"] is None
     assert [
-        call for call in calls if call[0] == "clone" and call[1] == PLUGINS_REPO
+        call for call in calls if call[0] == "clone" and call[1] == SYSTEM_REPO
     ] == []
 
 

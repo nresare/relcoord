@@ -92,7 +92,7 @@ def make_change_processor(
         )
     return ManifestChangeProcessor(
         manifests_repository=settings.manifests_repository,
-        plugins_repository=settings.plugins_repository,
+        system_repository=settings.system_repository,
         outputs=settings.outputs,
         rollouts=settings.rollouts,
         idcat=settings.idcat,
@@ -103,7 +103,7 @@ def make_change_processor(
 def make_diff_processor(settings: Settings) -> DiffCommentProcessor:
     return DiffCommentProcessor(
         manifests_repository=settings.manifests_repository,
-        plugins_repository=settings.plugins_repository,
+        system_repository=settings.system_repository,
         outputs=settings.outputs,
         idcat=settings.idcat,
         commenter=GithubIssueCommenter(idcat=settings.idcat),
