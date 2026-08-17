@@ -8,8 +8,9 @@ are deployed to and waits, using watches rather than polling, until every
 changed object carries that deploy-id and every removed object is gone.
 
 Carrying the deploy-id only says that the write landed, not that it took effect.
-For Deployments the wait goes further and holds until the rollout the write asked
-for has finished; see ``_rollout_progress``.
+For the workload kinds that roll a write out — Deployments and StatefulSets — the
+wait goes further and holds until that rollout has finished; see
+``_deployment_rollout_progress`` and ``_statefulset_rollout_progress``.
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ from typing import Any, Protocol
 import boto3
 import httpx
 
-from relcoord.config import ClusterSettings
+from relcoord.auth import KUBERNETES_TOKEN_PATH
+from relcoord.config import OutputSettings
 from relcoord.eks import EksTokenAuth
 
 logger = logging.getLogger(__name__)
@@ -41,9 +43,10 @@ WATCH_TIMEOUT_SECONDS = 300.0
 # straight away, so a cluster refusing watches does not spin.
 WATCH_RETRY_SECONDS = 1.0
 CONNECT_TIMEOUT_SECONDS = 10.0
-# The apps/v1 deployments resource, the only kind with a rollout to wait for.
-DEPLOYMENTS_PATH_PREFIX = "/apis/apps/v1"
+# The apps/v1 group, which serves the kinds that have a rollout to wait for.
+APPS_PATH_PREFIX = "/apis/apps/v1"
 DEPLOYMENTS_RESOURCE_NAME = "deployments"
+STATEFULSETS_RESOURCE_NAME = "statefulsets"
 
 
 class KubernetesObjectRef(Protocol):
@@ -53,6 +56,17 @@ class KubernetesObjectRef(Protocol):
     def namespace(self) -> str | None: ...
     @property
     def name(self) -> str: ...
+    @property
+    def api_version(self) -> str:
+        """The manifest's apiVersion, empty when the manifest had none.
+
+        A kind alone is not unique in a cluster: a provider CRD is free to
+        define a kind Kubernetes already defines, and iam.aws.m.upbound.io
+        defines a Role of its own alongside rbac.authorization.k8s.io. The group
+        this names is what tells the two apart when discovery is asked which
+        resource a reference means.
+        """
+        ...
 
 
 class DeploymentDetectionError(Exception):
@@ -115,32 +129,67 @@ class KubernetesResource:
             return f"{self.path_prefix}/{self.name}"
         return f"{self.path_prefix}/namespaces/{namespace}/{self.name}"
 
+    @property
+    def group(self) -> str:
+        """The API group serving this resource, empty for the core group."""
+        parts = self.path_prefix.split("/")
+        # /apis/<group>/<version>, against /api/<version> for the core group.
+        return parts[2] if len(parts) == 4 else ""
 
-def cluster_client(cluster: ClusterSettings) -> httpx.Client:
-    """Return a client that talks to ``cluster`` as the ambient AWS identity."""
-    if not cluster.ca_path.exists():
+
+def cluster_client(output: OutputSettings) -> httpx.Client:
+    """Return a client for the cluster represented by ``output``."""
+    if output.connection_type is None:
+        raise DeploymentDetectionError(f"output {output.name} has no connection-type")
+    if output.api_endpoint is None:
+        raise DeploymentDetectionError(f"output {output.name} has no API endpoint")
+    if output.ca_path is None:
+        raise DeploymentDetectionError(f"output {output.name} has no CA certificate")
+    if not output.ca_path.exists():
         raise DeploymentDetectionError(
-            f"CA certificate {cluster.ca_path} for cluster {cluster.name} does "
-            "not exist"
+            f"CA certificate {output.ca_path} for cluster {output.name} does not exist"
         )
     try:
-        ssl_context = ssl.create_default_context(cafile=str(cluster.ca_path))
+        ssl_context = ssl.create_default_context(cafile=str(output.ca_path))
     except ssl.SSLError as exc:
         raise DeploymentDetectionError(
-            f"CA certificate {cluster.ca_path} for cluster {cluster.name} is not "
+            f"CA certificate {output.ca_path} for cluster {output.name} is not "
             f"a readable PEM certificate: {exc}"
         ) from exc
-    session = boto3.Session(region_name=cluster.region)
+    authentication: dict[str, Any]
+    if output.connection_type == "local":
+        authentication = {
+            "headers": {"Authorization": f"Bearer {_service_account_token(output)}"}
+        }
+    else:
+        session = boto3.Session(region_name=output.region)
+        authentication = {"auth": EksTokenAuth(session, output.eks_name)}
     return httpx.Client(
-        base_url=cluster.api_endpoint.rstrip("/"),
+        base_url=output.api_endpoint.rstrip("/"),
         verify=ssl_context,
-        auth=EksTokenAuth(session, cluster.eks_name),
         # Reads have to outlast a watch that is idle but healthy, which is the
         # normal state of a watch waiting for a deployment to roll out.
         timeout=httpx.Timeout(
             WATCH_TIMEOUT_SECONDS + 60.0, connect=CONNECT_TIMEOUT_SECONDS
         ),
+        **authentication,
     )
+
+
+def _service_account_token(output: OutputSettings) -> str:
+    try:
+        token = KUBERNETES_TOKEN_PATH.read_text().strip()
+    except OSError as exc:
+        raise DeploymentDetectionError(
+            f"service account token {KUBERNETES_TOKEN_PATH} for local cluster "
+            f"{output.name} could not be read: {exc}"
+        ) from exc
+    if not token:
+        raise DeploymentDetectionError(
+            f"service account token {KUBERNETES_TOKEN_PATH} for local cluster "
+            f"{output.name} is empty"
+        )
+    return token
 
 
 class KubernetesDeploymentDetector:
@@ -173,15 +222,15 @@ class KubernetesDeploymentDetector:
         self._resources_by_kind: dict[str, list[KubernetesResource]] | None = None
 
     @classmethod
-    def for_cluster(
+    def for_output(
         cls,
-        cluster: ClusterSettings,
+        output: OutputSettings,
         *,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> KubernetesDeploymentDetector:
         return cls(
-            client=cluster_client(cluster),
-            cluster_name=cluster.name,
+            client=cluster_client(output),
+            cluster_name=output.name,
             timeout_seconds=timeout_seconds,
             owns_client=True,
         )
@@ -391,24 +440,40 @@ class KubernetesDeploymentDetector:
             scope = "namespaced" if ref.namespace is not None else "cluster-scoped"
             raise DeploymentDetectionError(
                 f"cluster {self._cluster_name or '<unnamed>'} serves no "
-                f"{scope} resource of kind {ref.kind}"
+                f"{scope} resource of kind {ref.kind}{_of_api_version(ref)}"
             )
         if len(resources) > 1:
             served = ", ".join(
                 f"{resource.path_prefix}/{resource.name}" for resource in resources
             )
             raise DeploymentDetectionError(
-                f"kind {ref.kind} is ambiguous in cluster "
+                f"kind {ref.kind}{_of_api_version(ref)} is ambiguous in cluster "
                 f"{self._cluster_name or '<unnamed>'}: {served}"
             )
         return resources[0]
 
     def _matching_resources(self, ref: KubernetesObjectRef) -> list[KubernetesResource]:
-        return [
+        """The resources discovery serves for a ref's kind, scope and group.
+
+        The group comes from the ref's apiVersion and is what separates a kind
+        Kubernetes defines from one a provider CRD defines under the same name.
+        Only the group is compared, not the version: discovery reports one
+        version of each group, and a kind is the same kind in all of them.
+
+        A ref carrying no apiVersion is matched on kind and scope alone, which
+        is all there is to go on. Where that leaves several resources the wait
+        fails as ambiguous rather than picking one, since a wrong pick would
+        wait for an unrelated object.
+        """
+        resources = [
             resource
             for resource in self._resources_by_kind_cached().get(ref.kind, [])
             if resource.namespaced == (ref.namespace is not None)
         ]
+        if not ref.api_version:
+            return resources
+        group = _api_group(ref.api_version)
+        return [resource for resource in resources if resource.group == group]
 
     def _resources_by_kind_cached(self) -> dict[str, list[KubernetesResource]]:
         if self._resources_by_kind is None:
@@ -499,16 +564,16 @@ def _goal_for(resource: KubernetesResource, deploy_id: str) -> Goal:
     """Return what an object of this resource has to reach to count as deployed.
 
     Every object has to carry the deploy-id, which is what says the write landed.
-    A Deployment has to have finished rolling that write out on top of it.
+    A Deployment or a StatefulSet has to have finished rolling that write out on
+    top of it.
     """
-    if (
-        resource.path_prefix == DEPLOYMENTS_PATH_PREFIX
-        and resource.name == DEPLOYMENTS_RESOURCE_NAME
-    ):
-        return Goal(
-            description=f"deploy-id {deploy_id} with a complete rollout",
-            progress=lambda obj: _deployment_progress(obj, deploy_id),
-        )
+    if resource.path_prefix == APPS_PATH_PREFIX:
+        rollout = _ROLLOUT_PROGRESS.get(resource.name)
+        if rollout is not None:
+            return Goal(
+                description=f"deploy-id {deploy_id} with a complete rollout",
+                progress=lambda obj: _rollout_goal_progress(obj, deploy_id, rollout),
+            )
     return Goal(
         description=f"deploy-id {deploy_id}",
         progress=lambda obj: _deploy_id_progress(obj, deploy_id),
@@ -524,15 +589,24 @@ def _deploy_id_progress(obj: dict[str, Any] | None, deploy_id: str) -> Progress:
     return _complete()
 
 
-def _deployment_progress(obj: dict[str, Any] | None, deploy_id: str) -> Progress:
-    """Return how far a Deployment is towards having rolled the change out."""
+def _rollout_goal_progress(
+    obj: dict[str, Any] | None,
+    deploy_id: str,
+    rollout: Callable[[dict[str, Any]], Progress],
+) -> Progress:
+    """Return how far an object is towards having rolled the change out.
+
+    The write has to have landed before its rollout means anything, so the
+    deploy-id is checked first and the rollout only once it is the one the change
+    asked for.
+    """
     landed = _deploy_id_progress(obj, deploy_id)
     if landed.state is not ProgressState.COMPLETE or obj is None:
         return landed
-    return _rollout_progress(obj)
+    return rollout(obj)
 
 
-def _rollout_progress(obj: dict[str, Any]) -> Progress:
+def _deployment_rollout_progress(obj: dict[str, Any]) -> Progress:
     """Return how far an observed Deployment is through its rollout.
 
     These are the checks ``kubectl rollout status`` makes, in its order, and they
@@ -595,6 +669,90 @@ def _rollout_progress(obj: dict[str, Any]) -> Progress:
             "updated and available"
         )
     return _pending(_with_replica_failure(status, detail))
+
+
+def _statefulset_rollout_progress(obj: dict[str, Any]) -> Progress:
+    """Return how far an observed StatefulSet is through its rollout.
+
+    These are the checks ``kubectl rollout status`` makes of a StatefulSet, in its
+    order: the controller observes the new generation, every replica becomes
+    ready, and the replicas the update strategy covers are updated to the new
+    revision. Unlike a Deployment a StatefulSet replaces its pods in place rather
+    than through a second ReplicaSet, so there is nothing to drain and
+    ``status.readyReplicas`` counts the same pods throughout.
+
+    ``rollingUpdate.partition`` holds the ordinals below it back on purpose, so
+    the rollout is complete once the ordinals at or above it have been updated —
+    a partitioned rollout is a canary that is finished when its canary is, not one
+    that never finishes. A StatefulSet updated ``OnDelete`` has nothing rolling
+    the change out at all: its pods are replaced when someone deletes them, which
+    may be long after the change, so the write landing is as far as this can wait.
+    """
+    spec = _child(obj, "spec")
+    status = _child(obj, "status")
+    strategy = _child(spec, "updateStrategy")
+
+    generation = _count(_child(obj, "metadata").get("generation"))
+    observed_generation = _count(status.get("observedGeneration"))
+    if observed_generation < generation:
+        return _pending(
+            f"the statefulset controller has observed generation "
+            f"{observed_generation}, not {generation}"
+        )
+
+    if strategy.get("type") == "OnDelete":
+        return _complete(
+            f"generation {generation} observed; it is updated OnDelete, so no "
+            "controller rolls the change out to its pods"
+        )
+
+    # Absent from the JSON means zero: the replica counts are all omitempty.
+    desired = _count(spec.get("replicas"), default=1)
+    ready = _count(status.get("readyReplicas"))
+    updated = _count(status.get("updatedReplicas"))
+    if ready < desired:
+        return _pending(f"{ready} of {desired} replicas are ready")
+
+    partition = _count(_child(strategy, "rollingUpdate").get("partition"))
+    if partition > 0:
+        # A partition above the replica count holds every pod back, which leaves
+        # nothing for the rollout to do rather than a negative amount of it.
+        covered = max(desired - partition, 0)
+        if updated < covered:
+            return _pending(
+                f"{updated} of {covered} replicas above partition {partition} "
+                "have been updated"
+            )
+        return _complete(
+            f"generation {generation} observed, {updated} of {covered} replicas "
+            f"above partition {partition} updated and {ready} of {desired} ready"
+        )
+
+    if updated < desired:
+        return _pending(f"{updated} of {desired} replicas have been updated")
+    current_revision = status.get("currentRevision")
+    update_revision = status.get("updateRevision")
+    if (
+        isinstance(current_revision, str)
+        and isinstance(update_revision, str)
+        and current_revision != update_revision
+    ):
+        return _pending(
+            f"its pods are at revision {update_revision}, which the controller "
+            f"has not yet made current in place of {current_revision}"
+        )
+    return _complete(
+        f"generation {generation} observed, {updated} of {desired} replicas "
+        "updated and ready"
+    )
+
+
+# The apps/v1 resources whose rollout of a write is waited for, and how each one
+# reports how far through that rollout it is.
+_ROLLOUT_PROGRESS: dict[str, Callable[[dict[str, Any]], Progress]] = {
+    DEPLOYMENTS_RESOURCE_NAME: _deployment_rollout_progress,
+    STATEFULSETS_RESOURCE_NAME: _statefulset_rollout_progress,
+}
 
 
 def _with_replica_failure(status: dict[str, Any], detail: str) -> str:
@@ -674,6 +832,19 @@ def _add_resources(
                 namespaced=namespaced,
             )
         )
+
+
+def _api_group(api_version: str) -> str:
+    """The group an apiVersion names, empty for the core group's bare version."""
+    group, _, _ = api_version.rpartition("/")
+    return group
+
+
+def _of_api_version(ref: KubernetesObjectRef) -> str:
+    """Name a ref's apiVersion for an error message, saying when it had none."""
+    if not ref.api_version:
+        return " (the manifest carried no apiVersion)"
+    return f" in {ref.api_version}"
 
 
 def _format_ref(ref: KubernetesObjectRef) -> str:

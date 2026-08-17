@@ -11,6 +11,7 @@ it.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -22,6 +23,8 @@ from relcoord.git import github_https_credentials, github_repo_from_url
 GITHUB_API_BASE_URL = "https://api.github.com"
 GITHUB_API_VERSION = "2026-03-10"
 COMMENT_TIMEOUT_SECONDS = 30.0
+COMMENTS_PER_PAGE = 100
+MAX_COMMENT_PAGES = 10
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +33,18 @@ class GithubCommentError(Exception):
     """Raised when a pull request comment cannot be posted."""
 
 
+@dataclass(frozen=True)
+class PostedComment:
+    """Where a comment ended up, and whether it replaced an earlier one."""
+
+    url: str | None = None
+    updated: bool = False
+
+
 class IssueCommenter(Protocol):
-    def post_comment(self, repo: str, pull_request: int, body: str) -> str | None: ...
+    def post_comment(
+        self, repo: str, pull_request: int, body: str, *, marker: str | None = None
+    ) -> PostedComment: ...
 
 
 @dataclass(frozen=True)
@@ -39,8 +52,14 @@ class GithubIssueCommenter:
     idcat: IdcatSettings | None = None
     api_base_url: str = GITHUB_API_BASE_URL
 
-    def post_comment(self, repo: str, pull_request: int, body: str) -> str | None:
+    def post_comment(
+        self, repo: str, pull_request: int, body: str, *, marker: str | None = None
+    ) -> PostedComment:
         """Comment on a pull request, returning the comment's URL if given.
+
+        ``marker`` is a string the body carries to identify a comment as ours: an
+        existing comment on the pull request containing it is edited in place
+        rather than joined by a second one.
 
         Raises:
             GithubCommentError: if the repository is not a GitHub HTTPS URL, no
@@ -61,32 +80,104 @@ class GithubIssueCommenter:
                 "commenting on a pull request requires [idcat] configuration"
             )
 
-        url = (
+        issues_url = (
             f"{self.api_base_url.rstrip('/')}/repos/"
-            f"{github_repo.owner}/{github_repo.name}/issues/{pull_request}/comments"
+            f"{github_repo.owner}/{github_repo.name}/issues"
         )
+        headers = {
+            "Authorization": f"Bearer {credentials.password}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        }
+
+        existing = (
+            None
+            if marker is None
+            else _existing_comment_id(
+                f"{issues_url}/{pull_request}/comments", headers, marker
+            )
+        )
+        if existing is not None:
+            url = f"{issues_url}/comments/{existing}"
+            return PostedComment(
+                url=_comment_url(_send(httpx.patch, url, body, headers)), updated=True
+            )
+
+        url = f"{issues_url}/{pull_request}/comments"
+        return PostedComment(url=_comment_url(_send(httpx.post, url, body, headers)))
+
+
+def _send(
+    method: Callable[..., httpx.Response],
+    url: str,
+    body: str,
+    headers: dict[str, str],
+) -> httpx.Response:
+    try:
+        response = method(
+            url,
+            json={"body": body},
+            headers=headers,
+            timeout=COMMENT_TIMEOUT_SECONDS,
+        )
+    except httpx.RequestError as exc:
+        raise GithubCommentError(f"failed to post a comment to {url}: {exc}") from exc
+
+    if not response.is_success:
+        raise GithubCommentError(
+            f"GitHub returned HTTP {response.status_code} "
+            f"for a comment to {url}: {response.text}"
+        )
+    return response
+
+
+def _existing_comment_id(url: str, headers: dict[str, str], marker: str) -> int | None:
+    """Return the id of the newest comment on the pull request carrying marker."""
+    found: int | None = None
+    for page in range(1, MAX_COMMENT_PAGES + 1):
         try:
-            response = httpx.post(
+            response = httpx.get(
                 url,
-                json={"body": body},
-                headers={
-                    "Authorization": f"Bearer {credentials.password}",
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": GITHUB_API_VERSION,
-                },
+                params={"per_page": COMMENTS_PER_PAGE, "page": page},
+                headers=headers,
                 timeout=COMMENT_TIMEOUT_SECONDS,
             )
         except httpx.RequestError as exc:
             raise GithubCommentError(
-                f"failed to post a comment to {url}: {exc}"
+                f"failed to list the comments at {url}: {exc}"
             ) from exc
 
         if not response.is_success:
             raise GithubCommentError(
                 f"GitHub returned HTTP {response.status_code} "
-                f"for a comment to {url}: {response.text}"
+                f"for the comments at {url}: {response.text}"
             )
-        return _comment_url(response)
+
+        comments = _comment_list(response)
+        for comment in comments:
+            identifier = comment.get("id")
+            body = comment.get("body")
+            if isinstance(identifier, int) and isinstance(body, str) and marker in body:
+                found = identifier
+        if len(comments) < COMMENTS_PER_PAGE:
+            return found
+    logger.warning(
+        "stopped looking for an earlier comment after %d pages of %s",
+        MAX_COMMENT_PAGES,
+        url,
+    )
+    return found
+
+
+def _comment_list(response: httpx.Response) -> list[dict[str, Any]]:
+    try:
+        payload: Any = response.json()
+    except ValueError:
+        logger.warning("GitHub answered a comment listing with a non-JSON body")
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [comment for comment in payload if isinstance(comment, dict)]
 
 
 def _comment_url(response: httpx.Response) -> str | None:

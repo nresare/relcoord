@@ -15,6 +15,7 @@ from relcoord.manifest_diff import (
     DiffSection,
     ManifestDiff,
     build_comment_body,
+    comment_marker,
     filter_metadata_hunks,
     manifest_diff,
     markdown_fence,
@@ -35,6 +36,27 @@ DEPLOYMENT = (
     "      containers:\n"
     "      - name: app\n"
     "        image: example/app:{version}\n"
+)
+
+CHECKSUM_DEPLOYMENT = (
+    "apiVersion: apps/v1\n"
+    "kind: Deployment\n"
+    "metadata:\n"
+    "  name: app\n"
+    "  annotations:\n"
+    "    noa.re/deploy-id: generated\n"
+    "spec:\n"
+    "  replicas: {replicas}\n"
+    "  template:\n"
+    "    metadata:\n"
+    "      annotations:\n"
+    "        checksum/config: {checksum}\n"
+    "      labels:\n"
+    "        app: app\n"
+    "    spec:\n"
+    "      containers:\n"
+    "      - name: app\n"
+    "        image: example/app:v1\n"
 )
 
 SERVICE = (
@@ -204,6 +226,98 @@ def test_manifest_diff_drops_a_deploy_id_only_change(tmp_path: Path) -> None:
     assert "noa.re/deploy-id" not in comment.body
     assert "returned in the response" in comment.body
     assert comment.omitted_context_diff
+
+
+def test_manifest_diff_drops_a_checksum_only_change(tmp_path: Path) -> None:
+    repo = porcelain.init(str(tmp_path))
+    first = _commit(
+        repo,
+        {"deployment.yaml": CHECKSUM_DEPLOYMENT.format(replicas=1, checksum="aaa")},
+        "one",
+    )
+    second = _commit(
+        repo,
+        {"deployment.yaml": CHECKSUM_DEPLOYMENT.format(replicas=1, checksum="bbb")},
+        "two",
+    )
+
+    result = _diff(repo, first, second)
+
+    assert "checksum/config: bbb" in result.diff
+    assert result.filtered_diff == ""
+
+
+def test_manifest_diff_keeps_a_real_change_next_to_a_checksum(tmp_path: Path) -> None:
+    repo = porcelain.init(str(tmp_path))
+    first = _commit(
+        repo,
+        {"deployment.yaml": CHECKSUM_DEPLOYMENT.format(replicas=1, checksum="aaa")},
+        "one",
+    )
+    second = _commit(
+        repo,
+        {"deployment.yaml": CHECKSUM_DEPLOYMENT.format(replicas=2, checksum="bbb")},
+        "two",
+    )
+
+    result = _diff(repo, first, second)
+
+    assert result.filtered_diff is not None
+    assert "+  replicas: 2" in result.filtered_diff
+    assert "checksum/config" not in result.filtered_diff
+
+
+def test_filter_metadata_hunks_drops_an_added_checksum_annotation() -> None:
+    raw_diff = (
+        "diff --git a/deployment.yaml b/deployment.yaml\n"
+        "index 1234567..89abcde 100644\n"
+        "--- a/deployment.yaml\n"
+        "+++ b/deployment.yaml\n"
+        "@@ -12,6 +12,9 @@ spec:\n"
+        "   template:\n"
+        "     metadata:\n"
+        "+      annotations:\n"
+        "+        checksum/config: 89abcde\n"
+        "+        checksum/secret: 1234567\n"
+        "       labels:\n"
+        "         app: app\n"
+    )
+
+    filtered_diff = filter_metadata_hunks(
+        raw_diff, {("metadata", "annotations", "noa.re/deploy-id")}
+    )
+
+    assert filtered_diff == ""
+
+
+def test_manifest_diff_leaves_a_checksum_out_of_the_metadata_summary(
+    tmp_path: Path,
+) -> None:
+    repo = porcelain.init(str(tmp_path))
+    manifest = (
+        "kind: ConfigMap\n"
+        "metadata:\n"
+        "  name: {name}\n"
+        "  annotations:\n"
+        "    checksum/config: {checksum}\n"
+        "data:\n"
+        "  greeting: {greeting}\n"
+    )
+    files = {
+        f"{name}.yaml": manifest.format(name=name, checksum=checksum, greeting=greeting)
+        for name, checksum, greeting in (("one", "aaa", "hi"), ("two", "aaa", "hi"))
+    }
+    first = _commit(repo, files, "one")
+    second = _commit(
+        repo,
+        {name: content.replace("aaa", "bbb") for name, content in files.items()},
+        "two",
+    )
+
+    result = _diff(repo, first, second)
+
+    assert result.summary == ""
+    assert result.filtered_diff == ""
 
 
 def test_manifest_diff_labels_hunk_headers_with_the_enclosing_key(
@@ -406,3 +520,13 @@ def test_markdown_fence_outgrows_the_backticks_it_has_to_hold() -> None:
     assert markdown_fence("plain") == "```"
     assert markdown_fence("a ``` fence") == "````"
     assert markdown_fence("a ````` fence") == "``````"
+
+
+def test_build_comment_body_carries_the_marker_as_a_hidden_first_line() -> None:
+    comment = build_comment_body(
+        [DiffSection(heading=None, diff=ManifestDiff(stat="", diff=""))],
+        full_diff_reference="unused",
+        marker=comment_marker(),
+    )
+
+    assert comment.body.startswith("<!-- relcoord:manifest-diff -->\n")

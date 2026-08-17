@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 PortSwigger Ltd
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from io import BytesIO
@@ -9,18 +10,24 @@ from pathlib import Path
 import pytest
 from dulwich import porcelain
 from dulwich.errors import NotGitRepository
+from manifest_builder import ExternalPlugins
 
 from relcoord import change
 from relcoord.change import (
+    ChangeProcessingError,
     ChangeProcessor,
     ChangeProgress,
     CredentialError,
     DeployConfigError,
     DeploymentDetectionError,
     GitTransportError,
+    RolloutStageError,
+    SystemRepositoryError,
 )
-from relcoord.config import ClusterSettings, OutputSettings
+from relcoord.config import OutputSettings, RolloutSettings, RolloutStage
 from relcoord.git import GitCredentialError
+
+SYSTEM_REPO = "https://github.com/acme/shared-system.git"
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,7 @@ class Ref:
     kind: str
     namespace: str | None
     name: str
+    api_version: str = "v1"
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,7 @@ def test_change_processor_checks_out_deploy_config_generates_commit_and_pushes(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         calls.append(
             (
@@ -179,6 +188,7 @@ def test_change_processor_reports_progress_for_each_step(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         return GenerationResult(
             written_paths={manifests_checkout / "api.yaml"},
@@ -208,15 +218,16 @@ def test_change_processor_reports_progress_for_each_step(
         progress=events.append,
     )
 
+    # The temporary workspace and the manifests commit are logged rather than
+    # streamed: one is a path nobody watching a deployment cares about, and the
+    # other is named by the push lines either side of it.
     assert [event.phase for event in events] == [
-        "workspace",
         "source-checkout",
         "deploy-config",
         "manifests-checkout",
         "generate",
         "generated",
         "changed-objects",
-        "commit",
         "push",
         "pushed",
     ]
@@ -232,24 +243,26 @@ def test_change_processor_reports_progress_for_each_step(
         "removed": [],
     }
     assert by_phase["changed-objects"].message == (
-        "output manifests created or modified Deployment/config/api "
-        "(deploy-id 0123456789abcdef)"
+        "manifests: updated Deployment config/api"
     )
     assert by_phase["source-checkout"].detail == {
         "repo": "https://github.com/acme/config.git",
         "commit": "deadbeef",
     }
-    assert by_phase["source-checkout"].message == (
-        "checking out source repo https://github.com/acme/config.git at commit deadbeef"
-    )
+    assert by_phase["source-checkout"].message == "checking out acme/config at deadbee"
     assert by_phase["deploy-config"].detail["namespace"] == "config"
     assert by_phase["deploy-config"].detail["system"] is False
+    assert by_phase["deploy-config"].message == (
+        "generating for namespace config from .deploy"
+    )
     assert by_phase["generated"].detail["generated"] == 1
     assert "paths" not in by_phase["generated"].detail
+    assert by_phase["generated"].message == "manifests: 1 of 1 manifests changed"
     assert by_phase["push"].detail == {
         "repository": "https://github.com/acme/manifests.git",
         "manifest_commit": "feedface",
     }
+    assert by_phase["push"].message == "pushing feedfac to acme/manifests"
 
 
 def test_change_processor_reports_no_changes_progress(
@@ -270,6 +283,7 @@ def test_change_processor_reports_no_changes_progress(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         return GenerationResult(
             written_paths=set(),
@@ -294,7 +308,7 @@ def test_change_processor_reports_no_changes_progress(
     )
 
     assert [event.phase for event in events][-1] == "no-changes"
-    assert "nothing to commit or push" in events[-1].message
+    assert events[-1].message == "no changes for acme/manifests"
 
 
 def test_change_processor_generates_configured_outputs_with_vars(
@@ -339,6 +353,7 @@ def test_change_processor_generates_configured_outputs_with_vars(
         image: str | None,
         namespace: str,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         calls.append(
             (
@@ -500,6 +515,7 @@ def test_change_processor_generates_targets_for_a_version_2_config(
         image: str | None,
         namespace: str,
         target: str,
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         calls.append(("generate", output_path.name, target))
         return GenerationResult(
@@ -840,6 +856,7 @@ def test_change_processor_system_mode_uses_root_and_no_namespace(
         image: str | None,
         namespace: str | None,
         vars: dict[str, object],
+        plugins: ExternalPlugins | None = None,
     ) -> GenerationResult:
         captured["deploy_config"] = deploy_config
         captured["namespace"] = namespace
@@ -876,6 +893,150 @@ def test_change_processor_system_mode_uses_root_and_no_namespace(
     assert captured["deploy_config"] == tmp_path / "source"
     assert captured["namespace"] is None
     assert captured["image"] is None
+
+
+def _system_repository_change_fakes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured: dict[str, object],
+    *,
+    clones: list[tuple[str, Path, dict[str, object]]] | None = None,
+    plugins_dir: bool = True,
+) -> None:
+    """Fake out the git and generate calls, keeping the system plugins.
+
+    The system repository is the one clone whose contents matter here, so its
+    checkout gets a plugins directory unless a test is about that directory
+    being missing.
+    """
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        if clones is not None:
+            clones.append((repo, target, kwargs))
+        target.mkdir(parents=True)
+        if repo == SYSTEM_REPO and plugins_dir:
+            (target / "plugins").mkdir()
+
+    def fake_generate(
+        deploy_config: Path,
+        output_path: Path,
+        **kwargs,
+    ) -> GenerationResult:
+        captured["plugins"] = kwargs.get("plugins")
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified={Ref(kind="Deployment", namespace="c", name="api")},
+            removed=set(),
+            deploy_id="0123456789abcdef",
+        )
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", lambda *args: None)
+
+
+def test_change_checks_out_the_system_repository_and_passes_plugins_to_generate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    clones: list[tuple[str, Path, dict[str, object]]] = []
+    _system_repository_change_fakes(tmp_path, monkeypatch, captured, clones=clones)
+    events: list[ChangeProgress] = []
+
+    ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        system_repository=SYSTEM_REPO,
+    ).process(
+        "https://github.com/acme/config.git",
+        "deadbeef",
+        None,
+        progress=events.append,
+    )
+
+    assert captured["plugins"] == ExternalPlugins(
+        path=tmp_path / "system" / "plugins",
+        source=f"{SYSTEM_REPO}@feedface",
+    )
+    system_clone = [clone for clone in clones if clone[0] == SYSTEM_REPO]
+    assert system_clone == [
+        (
+            SYSTEM_REPO,
+            tmp_path / "system",
+            {
+                "purpose": f"cloning system repo {SYSTEM_REPO}",
+                "depth": "1",
+                "branch": "main",
+            },
+        )
+    ]
+    checkout = [event for event in events if event.phase == "system-checkout"]
+    assert [event.detail["source"] for event in checkout] == [f"{SYSTEM_REPO}@feedface"]
+
+
+def test_change_leaves_the_system_repository_out_of_system_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    clones: list[tuple[str, Path, dict[str, object]]] = []
+
+    # System config lives at the repository root, and carries its own plugins.
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        target.mkdir(parents=True)
+
+    _system_repository_change_fakes(tmp_path, monkeypatch, captured, clones=clones)
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+
+    ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        system_repository=SYSTEM_REPO,
+    ).process(
+        "https://github.com/acme/system.git",
+        "deadbeef",
+        None,
+        system=True,
+    )
+
+    assert captured["plugins"] is None
+    assert [clone[0] for clone in clones if clone[0] == SYSTEM_REPO] == []
+
+
+def test_change_passes_no_plugins_without_a_configured_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    _system_repository_change_fakes(tmp_path, monkeypatch, captured)
+
+    ChangeProcessor("https://github.com/acme/manifests.git").process(
+        "https://github.com/acme/config.git", "deadbeef", None
+    )
+
+    assert captured["plugins"] is None
+
+
+def test_change_rejects_a_system_repository_without_a_plugins_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    _system_repository_change_fakes(tmp_path, monkeypatch, captured, plugins_dir=False)
+
+    processor = ChangeProcessor(
+        "https://github.com/acme/manifests.git",
+        system_repository=SYSTEM_REPO,
+    )
+    with pytest.raises(SystemRepositoryError) as excinfo:
+        processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert str(excinfo.value) == (
+        f"system repo {SYSTEM_REPO} at commit feedface has no plugins/ directory"
+    )
 
 
 def test_dulwich_error_message_includes_action_and_parameters() -> None:
@@ -1071,12 +1232,7 @@ def test_change_processor_reports_the_objects_a_change_touched(
                 name="example-dev",
                 repository="https://github.com/acme/manifests.git",
                 directory=Path("example-dev"),
-                cluster="example-dev",
-            )
-        ],
-        clusters=[
-            ClusterSettings(
-                name="example-dev",
+                connection_type="eks",
                 api_endpoint="https://example.eks.amazonaws.com",
                 ca_path=Path("/ca.pem"),
             )
@@ -1104,19 +1260,19 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
     observed: dict[str, object] = {}
 
     class Detector:
-        def __init__(self, cluster: ClusterSettings) -> None:
-            self.cluster = cluster
+        def __init__(self, output: OutputSettings) -> None:
+            self.output = output
 
         def wait_for_success(self, **kwargs) -> None:
             observed.update(kwargs)
-            observed["cluster"] = self.cluster.name
+            observed["cluster"] = self.output.name
             detected.set()
 
         def close(self) -> None:
             observed["closed"] = True
 
-    def fake_for_cluster(cluster: ClusterSettings, **kwargs) -> Detector:
-        return Detector(cluster)
+    def fake_for_output(output: OutputSettings, **kwargs) -> Detector:
+        return Detector(output)
 
     def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
         (target / ".deploy").mkdir(parents=True)
@@ -1141,7 +1297,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
     monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
     monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
     monkeypatch.setattr(
-        change.KubernetesDeploymentDetector, "for_cluster", fake_for_cluster
+        change.KubernetesDeploymentDetector, "for_output", fake_for_output
     )
 
     ChangeProcessor(
@@ -1150,12 +1306,7 @@ def test_change_processor_detects_deployment_in_the_output_cluster(
                 name="example-dev",
                 repository="https://github.com/acme/manifests.git",
                 directory=Path("example-dev"),
-                cluster="example-dev",
-            )
-        ],
-        clusters=[
-            ClusterSettings(
-                name="example-dev",
+                connection_type="eks",
                 api_endpoint="https://example.eks.amazonaws.com",
                 ca_path=Path("/ca.pem"),
             )
@@ -1195,8 +1346,440 @@ def test_change_processor_rejects_detection_without_a_cluster(
     monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
     monkeypatch.setattr(change, "_push_repository", lambda *a, **k: None)
 
-    with pytest.raises(DeploymentDetectionError, match="does not name a cluster"):
+    with pytest.raises(DeploymentDetectionError, match="has no connection-type"):
         ChangeProcessor(
             "https://github.com/acme/manifests.git",
             detect_deployment=True,
         ).process("https://github.com/acme/config.git", "deadbeef", None)
+
+
+ROLLOUT_REPOSITORY = "https://github.com/acme/manifests.git"
+
+ROLLOUT_OUTPUTS = [
+    OutputSettings(
+        name="platform-dev",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-dev"),
+    ),
+    OutputSettings(
+        name="platform-prod",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-prod"),
+    ),
+    OutputSettings(
+        name="observability",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("observability"),
+    ),
+]
+
+# platform-dev first, then the two outputs that wait for it.
+LINEAR_ROLLOUT = RolloutSettings(
+    name="linear",
+    stages=(
+        RolloutStage(outputs=("platform-dev",)),
+        RolloutStage(outputs=("platform-prod", "observability")),
+    ),
+)
+
+
+def _staged_change_processor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    changed: set[str],
+    failing: frozenset[str] = frozenset(),
+) -> tuple[ChangeProcessor, list[str]]:
+    """A processor whose outputs generate changes only where ``changed`` says.
+
+    The recorded calls are what a rollout is about: which outputs were generated
+    and pushed, and in what order that interleaved with waiting for the
+    deployments to be observed. Each output's deploy-id names it, so a wait says
+    which output it was waiting for.
+    """
+    calls: list[str] = []
+
+    class Detector:
+        def wait_for_success(
+            self, *, deploy_id: str, created_or_modified: set, removed: set
+        ) -> None:
+            calls.append(f"verify:{deploy_id}")
+            if deploy_id in failing:
+                raise RuntimeError(f"{deploy_id} never reached the cluster")
+
+    def fake_checkout_commit(repo: str, commit: str, target: Path, idcat) -> None:
+        (target / ".deploy").mkdir(parents=True)
+
+    def fake_clone_repository(repo: str, target: Path, idcat, **kwargs) -> None:
+        calls.append("clone")
+        target.mkdir(parents=True)
+
+    def fake_generate(
+        deploy_config: Path, output_path: Path, **kwargs
+    ) -> GenerationResult:
+        name = output_path.name
+        calls.append(f"generate:{name}")
+        return GenerationResult(
+            written_paths={output_path / "api.yaml"},
+            created_or_modified=(
+                {Ref(kind="Deployment", namespace="config", name=name)}
+                if name in changed
+                else set()
+            ),
+            removed=set(),
+            deploy_id=f"deploy-{name}",
+        )
+
+    def fake_push_repository(repo_path: Path, remote: str, idcat) -> None:
+        calls.append("push")
+
+    monkeypatch.setattr(
+        change, "tempfile", type("T", (), {"mkdtemp": lambda prefix: str(tmp_path)})
+    )
+    monkeypatch.setattr(change, "_checkout_commit", fake_checkout_commit)
+    monkeypatch.setattr(change, "_clone_repository", fake_clone_repository)
+    monkeypatch.setattr(change, "generate", fake_generate)
+    monkeypatch.setattr(change, "_head_commit", lambda repo_path: "feedface")
+    monkeypatch.setattr(change, "_push_repository", fake_push_repository)
+
+    processor = ChangeProcessor(
+        outputs=ROLLOUT_OUTPUTS,
+        rollouts=[LINEAR_ROLLOUT],
+        detect_deployment=True,
+        deployment_detector=Detector(),
+    )
+    return processor, calls
+
+
+def test_rollout_waits_for_each_stage_before_deploying_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _staged_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"platform-dev", "platform-prod", "observability"},
+    )
+
+    result = processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert calls == [
+        "clone",
+        "generate:platform-dev",
+        "push",
+        "verify:deploy-platform-dev",
+        "generate:platform-prod",
+        "generate:observability",
+        "push",
+        "verify:deploy-platform-prod",
+        "verify:deploy-observability",
+    ]
+    assert [
+        (output.name, output.rollout, output.stage) for output in result.outputs
+    ] == [
+        ("platform-dev", "linear", 1),
+        ("platform-prod", "linear", 2),
+        ("observability", "linear", 2),
+    ]
+
+
+def test_rollout_skips_a_stage_whose_outputs_the_change_does_not_affect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _staged_change_processor(
+        tmp_path, monkeypatch, changed={"observability"}
+    )
+
+    events: list[ChangeProgress] = []
+    processor.process(
+        "https://github.com/acme/config.git", "deadbeef", None, progress=events.append
+    )
+
+    verified = [event for event in events if event.phase == "rollout-stage-verified"]
+    assert verified[0].message == "stage 1 of 2 skipped: platform-dev unaffected"
+    assert calls == [
+        "clone",
+        "generate:platform-dev",
+        "generate:platform-prod",
+        "generate:observability",
+        "push",
+        "verify:deploy-observability",
+    ]
+
+
+def test_rollout_stops_at_a_stage_whose_deployment_is_not_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, calls = _staged_change_processor(
+        tmp_path,
+        monkeypatch,
+        changed={"platform-dev", "platform-prod", "observability"},
+        failing=frozenset({"deploy-platform-dev"}),
+    )
+
+    with pytest.raises(
+        RolloutStageError,
+        match="deployment of manifest-builder deploy-id deploy-platform-dev "
+        "was not observed: deploy-platform-dev never reached the cluster",
+    ):
+        processor.process("https://github.com/acme/config.git", "deadbeef", None)
+
+    assert calls == [
+        "clone",
+        "generate:platform-dev",
+        "push",
+        "verify:deploy-platform-dev",
+    ]
+
+
+def test_rollout_reports_progress_for_each_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor, _ = _staged_change_processor(
+        tmp_path, monkeypatch, changed={"platform-dev", "observability"}
+    )
+
+    events: list[ChangeProgress] = []
+    processor.process(
+        "https://github.com/acme/config.git", "deadbeef", None, progress=events.append
+    )
+
+    assert [event.phase for event in events] == [
+        "source-checkout",
+        "deploy-config",
+        "rollout-stage",
+        "manifests-checkout",
+        "generate",
+        "generated",
+        "changed-objects",
+        "push",
+        "pushed",
+        "deployment-detection",
+        "rollout-stage-verified",
+        "rollout-stage",
+        "generate",
+        "generated",
+        "generate",
+        "generated",
+        "changed-objects",
+        "push",
+        "pushed",
+        "deployment-detection",
+        "rollout-stage-verified",
+    ]
+    stages = [event for event in events if event.phase == "rollout-stage"]
+    assert [event.detail for event in stages] == [
+        {
+            "rollout": "linear",
+            "stage": 1,
+            "stages": 2,
+            "outputs": ["platform-dev"],
+        },
+        {
+            "rollout": "linear",
+            "stage": 2,
+            "stages": 2,
+            "outputs": ["platform-prod", "observability"],
+        },
+    ]
+    assert [event.message for event in stages] == [
+        "rollout linear, stage 1 of 2: platform-dev",
+        "rollout linear, stage 2 of 2: platform-prod and observability",
+    ]
+    by_phase = {event.phase: event for event in events}
+    assert by_phase["deployment-detection"].message == (
+        "waiting for observability to pick up the change"
+    )
+    # How long the deployment took is what a reader is waiting to hear, so the
+    # message carries it; the value itself is whatever the clock said.
+    verified = [event for event in events if event.phase == "rollout-stage-verified"]
+    assert re.fullmatch(
+        r"stage 1 of 2 verified: platform-dev picked it up after \d+\.\d+s",
+        verified[0].message,
+    )
+    assert re.fullmatch(
+        r"stage 2 of 2 verified: observability picked it up after \d+\.\d+s",
+        verified[1].message,
+    )
+    assert verified[1].detail["outputs"] == ["observability"]
+
+
+def test_change_stages_without_rollouts_deploy_every_output_at_once() -> None:
+    stages = change._change_stages(ROLLOUT_OUTPUTS, ())
+
+    assert len(stages) == 1
+    assert stages[0].rollout is None
+    assert [output.name for output in stages[0].outputs] == [
+        "platform-dev",
+        "platform-prod",
+        "observability",
+    ]
+
+
+def test_change_stages_reject_an_unconfigured_output() -> None:
+    rollout = RolloutSettings(
+        name="linear", stages=(RolloutStage(outputs=("platform-staging",)),)
+    )
+
+    with pytest.raises(
+        ChangeProcessingError,
+        match="rollout 'linear' stage 1 names unconfigured output\\(s\\) "
+        "platform-staging",
+    ):
+        change._change_stages(ROLLOUT_OUTPUTS, (rollout,))
+
+
+@pytest.mark.parametrize(
+    ("repo", "expected"),
+    [
+        pytest.param(
+            "https://github.com/portswigger-cloud/system",
+            "portswigger-cloud/system",
+            id="https",
+        ),
+        pytest.param(
+            "https://github.com/acme/manifests.git", "acme/manifests", id="dot-git"
+        ),
+        pytest.param(
+            "https://github.com/acme/manifests/", "acme/manifests", id="slash"
+        ),
+        pytest.param("acme/config", "acme/config", id="already-short"),
+        pytest.param("manifests", "manifests", id="one-part"),
+    ],
+)
+def test_short_repo_names_a_repository_as_owner_and_name(
+    repo: str, expected: str
+) -> None:
+    assert change.short_repo(repo) == expected
+
+
+def test_short_commit_matches_what_git_prints() -> None:
+    assert change.short_commit("b8d4f34d8fd265311b7a379072441675ff524f6e") == "b8d4f34"
+    assert change.short_commit("deadbee") == "deadbee"
+    assert change.short_commit("dead") == "dead"
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        pytest.param([], "", id="none"),
+        pytest.param(["platform-dev"], "platform-dev", id="one"),
+        pytest.param(
+            ["platform-prod", "observability"],
+            "platform-prod and observability",
+            id="two",
+        ),
+        pytest.param(["a", "b", "c"], "a, b and c", id="three"),
+    ],
+)
+def test_join_names_reads_as_a_sentence(names: list[str], expected: str) -> None:
+    assert change.join_names(names) == expected
+
+
+def test_describe_refs_names_objects_the_way_kubectl_talks_about_them() -> None:
+    refs = (
+        Ref(kind="Deployment", namespace="relcoord", name="relcoord"),
+        Ref(kind="Namespace", namespace=None, name="relcoord"),
+    )
+
+    assert change._describe_refs(refs) == (
+        "Deployment relcoord/relcoord, Namespace relcoord"
+    )
+
+
+def test_describe_refs_cuts_a_long_list_short() -> None:
+    """A shared label change rewrites everything, and the detail keeps the rest."""
+    refs = tuple(
+        Ref(kind="ConfigMap", namespace="relcoord", name=f"c{index}")
+        for index in range(14)
+    )
+
+    assert change._describe_refs(refs) == (
+        "ConfigMap relcoord/c0, ConfigMap relcoord/c1, ConfigMap relcoord/c2 "
+        "and 11 more"
+    )
+
+
+CHANGED = (Ref(kind="Deployment", namespace="relcoord", name="relcoord"),)
+GONE = (Ref(kind="ConfigMap", namespace="relcoord", name="old"),)
+
+
+@pytest.mark.parametrize(
+    ("changed", "removed", "expected"),
+    [
+        pytest.param((), (), "platform-dev: none of 95 manifests changed", id="none"),
+        pytest.param(
+            CHANGED, (), "platform-dev: 1 of 95 manifests changed", id="changed"
+        ),
+        pytest.param(
+            CHANGED,
+            GONE,
+            "platform-dev: 1 of 95 manifests changed, 1 removed",
+            id="changed-and-removed",
+        ),
+        pytest.param(
+            (),
+            GONE,
+            "platform-dev: 0 of 95 manifests changed, 1 removed",
+            id="removed-only",
+        ),
+    ],
+)
+def test_generated_message_leads_with_what_the_change_did(
+    changed: tuple[Ref, ...], removed: tuple[Ref, ...], expected: str
+) -> None:
+    output = OutputSettings(
+        name="platform-dev",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-dev"),
+    )
+
+    assert change._generated_message(output, 95, changed, removed) == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "declares_targets", "expected"),
+    [
+        pytest.param(
+            None, True, "generating manifests for target platform-dev", id="target"
+        ),
+        pytest.param(
+            "prod",
+            True,
+            "generating manifests for target prod into platform-dev",
+            id="renamed-target",
+        ),
+        pytest.param(
+            None, False, "generating manifests for output platform-dev", id="vars"
+        ),
+    ],
+)
+def test_generating_message_uses_the_config_repositorys_own_terms(
+    target: str | None, declares_targets: bool, expected: str
+) -> None:
+    output = OutputSettings(
+        name="platform-dev",
+        repository=ROLLOUT_REPOSITORY,
+        directory=Path("platform-dev"),
+        target=target,
+    )
+
+    assert change._generating_message(output, declares_targets) == expected
+
+
+def test_stage_verified_message_reports_a_skipped_stage() -> None:
+    stage = change._change_stages(ROLLOUT_OUTPUTS, [LINEAR_ROLLOUT])[1]
+
+    assert change._stage_verified_message(stage, []) == (
+        "stage 2 of 2 skipped: platform-prod and observability unaffected"
+    )
+
+
+def test_stage_verified_message_reports_every_cluster_that_picked_it_up() -> None:
+    stage = change._change_stages(ROLLOUT_OUTPUTS, [LINEAR_ROLLOUT])[1]
+
+    assert change._stage_verified_message(
+        stage, [("platform-prod", 27.94), ("observability", 3.1)]
+    ) == (
+        "stage 2 of 2 verified: picked up by platform-prod after 27.9s "
+        "and observability after 3.1s"
+    )

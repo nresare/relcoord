@@ -5,21 +5,31 @@ port = 8080
 log-level = "INFO"
 detect-deployment = false
 
-# The output that /v1/diffcomment reports on, named after one of the [[output]]
-# entries below. Only that output is generated for a diff, so a pull request
-# comment shows one cluster's manifests rather than every cluster at once.
-# Defaults to all configured outputs.
-diff-output = "example-dev"
+# Shared system repository. For non-system requests, its "plugins" subdirectory
+# is passed to manifest-builder alongside the config directory's own plugins.
+# The latest commit on main is used, and its hash is recorded on the generated
+# manifests commit as "<repository>@<commit>".
+#
+# System-mode requests are not affected. Their config comes from a repository
+# that already carries the plugins it needs, so this repository is left out of
+# those.
+system-repository = "https://github.com/example/system"
 
 [[output]]
 name = "example-dev"
 repository = "https://github.com/example/manifests"
 directory = "example-dev"
-# The cluster these manifests are deployed to, named after a [[cluster]] entry
-# below. Deployment detection watches that cluster for the objects this output's
-# manifests describe, so detect-deployment = true requires every output to name
-# one.
-cluster = "example-dev"
+# How relcoord reaches the cluster this output is deployed to. This must be
+# explicit when deployment detection is enabled: "eks" uses ambient AWS
+# credentials; "local" uses the service account of relcoord's own cluster.
+connection-type = "eks"
+api-endpoint = "https://EXAMPLEDEVCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
+ca-path = "/etc/relcoord/example-dev-ca.pem"
+# Region to sign the EKS token in. Defaults to the region of relcoord's own AWS
+# session.
+region = "eu-west-1"
+# Defaults to the output name.
+eks-cluster-name = "example-dev"
 
 [output.vars]
 cluster_name = "example-dev"
@@ -36,17 +46,39 @@ name = "example-prod"
 repository = "https://github.com/example/manifests"
 directory = "example-prod"
 target = "prod"
-cluster = "example-prod"
+connection-type = "eks"
+api-endpoint = "https://EXAMPLEPRODCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
+ca-path = "/etc/relcoord/example-prod-ca.pem"
+region = "eu-west-1"
 
 [output.vars]
 cluster_name = "example-prod"
 account_id = 444455556666
 issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEPRODCLUSTERID"
 
-# Clusters relcoord watches a change materialise in. Each entry is an EKS
-# cluster reached with the ambient AWS credentials: relcoord signs a presigned
-# STS GetCallerIdentity URL as its own identity, so the cluster needs an access
-# entry for relcoord's IAM role, and that role may live in another account.
+# The order the outputs above are deployed in. Each stage is pushed and then
+# waited for, so example-prod is only deployed once the change has been observed
+# in example-dev. An output a change does not affect generates nothing, so it is
+# skipped rather than waited for: a change only example-prod is built from finds
+# the first stage empty and reaches example-prod straight away.
+#
+# Every output has to appear in exactly one stage of one rollout, and rollouts
+# require detect-deployment = true, since a stage waits for what it pushed.
+# Without any [[rollout]], every output is deployed at once and detection runs in
+# the background, which is what a deployment that wants no ordering configures.
+#
+# [[rollout]]
+# name = "linear"
+#
+# [[rollout.stage]]
+# outputs = ["example-dev"]
+#
+# [[rollout.stage]]
+# outputs = ["example-prod"]
+
+# EKS connections sign a presigned STS GetCallerIdentity URL as relcoord's own
+# identity, so the cluster needs an access entry for relcoord's IAM role, and
+# that role may live in another account.
 #
 # The API endpoint and CA certificate are configured rather than looked up
 # because eks:DescribeCluster only resolves clusters in the caller's own
@@ -56,22 +88,6 @@ issuer = "https://oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLEPRODCLUSTERID"
 #     --query 'cluster.{endpoint:endpoint,ca:certificateAuthority.data}'
 #
 # The CA is base64 in that output; ca-path points at the decoded PEM.
-[[cluster]]
-name = "example-dev"
-api-endpoint = "https://EXAMPLEDEVCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
-ca-path = "/etc/relcoord/example-dev-ca.pem"
-# Region to sign the token in. Defaults to the region of relcoord's own AWS
-# session, which is usually but not always the cluster's region.
-region = "eu-west-1"
-# The name EKS knows this cluster by, which the token is bound to. Defaults to
-# the name above.
-eks-cluster-name = "example-dev"
-
-[[cluster]]
-name = "example-prod"
-api-endpoint = "https://EXAMPLEPRODCLUSTERID.gr7.eu-west-1.eks.amazonaws.com"
-ca-path = "/etc/relcoord/example-prod-ca.pem"
-region = "eu-west-1"
 
 [persistence]
 backend = "surrealdb"

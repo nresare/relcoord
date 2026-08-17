@@ -52,11 +52,12 @@ def test_post_comment_uses_an_idcat_installation_token(tmp_path: Path) -> None:
             request=httpx.Request("POST", COMMENTS_URL),
         )
 
-        url = GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
+        posted = GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
             REPO, 7, "the diff"
         )
 
-    assert url == "https://github.com/acme/config/pull/7#issuecomment-1"
+    assert posted.url == "https://github.com/acme/config/pull/7#issuecomment-1"
+    assert not posted.updated
     assert fetch.call_args.args[1].name == "config"
     post.assert_called_once_with(
         COMMENTS_URL,
@@ -157,8 +158,141 @@ def test_post_comment_tolerates_a_response_without_a_url(tmp_path: Path) -> None
             201, text="not json", request=httpx.Request("POST", COMMENTS_URL)
         )
 
-        url = GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
+        posted = GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
             REPO, 7, "the diff"
         )
 
-    assert url is None
+    assert posted.url is None
+
+
+def _listing(comments: list[dict[str, object]], page: int = 1) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json=comments,
+        request=httpx.Request("GET", f"{COMMENTS_URL}?page={page}"),
+    )
+
+
+def test_post_comment_edits_an_earlier_comment_carrying_the_marker(
+    tmp_path: Path,
+) -> None:
+    marker = "<!-- relcoord:manifest-diff -->"
+    with (
+        patch("relcoord.git.fetch_installation_token", return_value="token"),
+        patch("relcoord.github.httpx.get") as get,
+        patch("relcoord.github.httpx.patch") as patch_request,
+        patch("relcoord.github.httpx.post") as post,
+    ):
+        get.return_value = _listing(
+            [
+                {"id": 1, "body": "a human's review"},
+                {"id": 2, "body": f"{marker}\n\nan older diff"},
+            ]
+        )
+        patch_request.return_value = httpx.Response(
+            200,
+            json={"html_url": "https://github.com/acme/config/pull/7#issuecomment-2"},
+            request=httpx.Request("PATCH", COMMENTS_URL),
+        )
+
+        posted = GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
+            REPO, 7, f"{marker}\n\nthe new diff", marker=marker
+        )
+
+    assert posted.updated
+    assert posted.url == "https://github.com/acme/config/pull/7#issuecomment-2"
+    post.assert_not_called()
+    assert patch_request.call_args.args[0] == (
+        "https://api.github.com/repos/acme/config/issues/comments/2"
+    )
+    assert patch_request.call_args.kwargs["json"] == {
+        "body": f"{marker}\n\nthe new diff"
+    }
+
+
+def test_post_comment_posts_when_no_comment_carries_the_marker(tmp_path: Path) -> None:
+    marker = "<!-- relcoord:manifest-diff -->"
+    with (
+        patch("relcoord.git.fetch_installation_token", return_value="token"),
+        patch("relcoord.github.httpx.get") as get,
+        patch("relcoord.github.httpx.patch") as patch_request,
+        patch("relcoord.github.httpx.post") as post,
+    ):
+        get.return_value = _listing(
+            [
+                {"id": 1, "body": "a human's review"},
+                {
+                    "id": 2,
+                    "body": "<!-- relcoord:manifest-diff prod -->\nanother scope",
+                },
+            ]
+        )
+        post.return_value = httpx.Response(
+            201, json={}, request=httpx.Request("POST", COMMENTS_URL)
+        )
+
+        posted = GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
+            REPO, 7, "the diff", marker=marker
+        )
+
+    assert not posted.updated
+    patch_request.assert_not_called()
+    assert post.call_args.args[0] == COMMENTS_URL
+
+
+def test_post_comment_edits_the_newest_marked_comment_across_pages(
+    tmp_path: Path,
+) -> None:
+    marker = "<!-- relcoord:manifest-diff -->"
+    with (
+        patch("relcoord.git.fetch_installation_token", return_value="token"),
+        patch("relcoord.github.httpx.get") as get,
+        patch("relcoord.github.httpx.patch") as patch_request,
+    ):
+        get.side_effect = [
+            _listing([{"id": index, "body": marker} for index in range(100)]),
+            _listing([{"id": 200, "body": f"{marker} newest"}], page=2),
+        ]
+        patch_request.return_value = httpx.Response(
+            200, json={}, request=httpx.Request("PATCH", COMMENTS_URL)
+        )
+
+        GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
+            REPO, 7, "the diff", marker=marker
+        )
+
+    assert [call.kwargs["params"]["page"] for call in get.call_args_list] == [1, 2]
+    assert patch_request.call_args.args[0].endswith("/issues/comments/200")
+
+
+def test_post_comment_reports_a_rejected_comment_listing(tmp_path: Path) -> None:
+    with (
+        patch("relcoord.git.fetch_installation_token", return_value="token"),
+        patch("relcoord.github.httpx.get") as get,
+        pytest.raises(GithubCommentError) as excinfo,
+    ):
+        get.return_value = httpx.Response(
+            403, text="no", request=httpx.Request("GET", COMMENTS_URL)
+        )
+
+        GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(
+            REPO, 7, "the diff", marker="<!-- relcoord:manifest-diff -->"
+        )
+
+    assert "GitHub returned HTTP 403" in str(excinfo.value)
+    assert "for the comments at" in str(excinfo.value)
+
+
+def test_post_comment_without_a_marker_does_not_list_comments(tmp_path: Path) -> None:
+    with (
+        patch("relcoord.git.fetch_installation_token", return_value="token"),
+        patch("relcoord.github.httpx.get") as get,
+        patch("relcoord.github.httpx.post") as post,
+    ):
+        post.return_value = httpx.Response(
+            201, json={}, request=httpx.Request("POST", COMMENTS_URL)
+        )
+
+        GithubIssueCommenter(idcat=_idcat(tmp_path)).post_comment(REPO, 7, "the diff")
+
+    get.assert_not_called()

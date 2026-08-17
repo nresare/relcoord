@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relcoord"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Image version service for relcoord."
 readme = "README.md"
 license = "MIT"
@@ -16,7 +16,7 @@ dependencies = [
   "dulwich",
   "httpx",
   "hypercorn",
-  "manifest-builder",
+  "manifest-builder>=0.7.9",
   "pyjwt[crypto]",
   "pyyaml",
   "starlette",
@@ -35,11 +35,26 @@ dev = [
 
 
 [[tool.uv.index]]
+name = "reposnake"
 url = "https://repo.noa.re/"
+
+[[tool.uv.index]]
+name = "upstream"
+url = "https://pypi.org/simple"
+
+# manifest-builder is released to PyPI, but reposnake still carries older
+# versions of it. Naming the index here keeps first-index-match in force for
+# every other dependency, rather than letting the whole resolution fall back to
+# whichever index happens to hold the newest version.
+[tool.uv.sources]
+manifest-builder = { index = "upstream" }
 
 [project.scripts]
 relcoord = "relcoord.main:main"
 relcoord-eks-kubeconfig = "relcoord.eks:main"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/relcoord"]
